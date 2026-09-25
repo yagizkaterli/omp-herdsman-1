@@ -1,0 +1,4391 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { test } from "node:test";
+import { Value } from "@sinclair/typebox/value";
+import type {
+  AskRecord,
+  RequestRecord,
+  ResultRecord,
+  ManagedAgentState,
+} from "./mailbox.ts";
+import { OperationError } from "./errors.ts";
+import { resultPath, resultRef } from "./storage.ts";
+import support, {
+  CHILD_SESSION_ID,
+  DEFAULT_OMP_SESSION_ID,
+  PARENT_SESSION_ID,
+  PI_AGENTS_DIR,
+  PI_AGENT_ROOT,
+  REQUEST_ID,
+  LEAD_SESSION_ID,
+  AGENT_ID,
+  WORKSPACE,
+  agentFromState,
+  cascadeExecutor,
+  controlMarker,
+  defaultFixtureIdentity,
+  delegatedLifecycleExecutor,
+  discoverAgent,
+  fakeContext,
+  fakePi,
+  fakeAgentContext,
+  herdrAlias,
+  isApiSnapshot,
+  isAgentList,
+  isPaneList,
+  managedState,
+  nativeSessions,
+  agentControllerExecutor,
+  promptLaunchContents,
+  promptLaunchPaths,
+  readRequest,
+  readResult,
+  readAgentState,
+  realFs,
+  recoveryIdentity,
+  registerExtension,
+  removeAsk,
+  removeRequest,
+  removeResult,
+  resetAgentMailbox,
+  resolveAssignmentSession,
+  resolveManagedSession,
+  leadExec,
+  setLeadEnvironment,
+  setAgentEnvironment,
+  startupExecutor,
+  agentMailboxPath,
+  writeAsk,
+  writePromptDefinition,
+  writeRequest,
+  writeResult,
+  writeAgentState,
+  testTmpRoot,
+} from "./support.ts";
+const { updateConfig } = await import("./config.ts");
+const ownershipResult = (child: string, owner = LEAD_SESSION_ID) => ({
+  type: "custom_message",
+  customType: "omp-herdsman-agent-result",
+  content: "",
+  display: true,
+  details: {
+    ompSessionId: child,
+    ownerSessionId: owner,
+    runId: randomUUID(),
+    requestId: randomUUID(),
+    agentLabel: "agent",
+    agentDefinition: "agent",
+    status: "completed",
+  },
+});
+
+test("project agent discovery is gated by scoped human approval", async () => {
+  setLeadEnvironment();
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-project-gate-"),
+  );
+  let pi: ReturnType<typeof fakePi> | undefined;
+  try {
+    const agents = join(project, ".omp", "agents");
+    realFs.mkdirSync(agents, { recursive: true });
+    realFs.writeFileSync(
+      join(agents, "project-only.md"),
+      "---\nname: project-only\n---\nproject policy",
+    );
+    pi = fakePi();
+    registerExtension!(pi.pi as never);
+    const command = pi.commandOptions.get("agents");
+    const context = fakeContext() as any;
+    context.cwd = project;
+    context.hasUI = true;
+    context.mode = "rpc";
+    const selections: string[][] = [];
+    context.ui.select = async (_title: string, options: string[]) => {
+      selections.push(options);
+      return undefined;
+    };
+    await command.handler("trust", context);
+    await command.handler("definitions", context);
+    assert.equal(
+      selections.at(-1)?.some((value) => value.includes("project-only")),
+      true,
+    );
+    realFs.writeFileSync(
+      join(PI_AGENTS_DIR, "project-only.md"),
+      "---\nname: project-only\nmodel: global/model\n---\nglobal policy",
+    );
+    realFs.writeFileSync(
+      join(PI_AGENTS_DIR, "standalone-global.md"),
+      "---\nname: standalone-global\n---\nglobal",
+    );
+    realFs.writeFileSync(
+      join(PI_AGENTS_DIR, "scout.md"),
+      "---\nname: scout\nmodel: global/model\n---\nglobal",
+    );
+    await command.handler("definitions", context);
+    const options = selections.at(-1) ?? [];
+    assert.ok(
+      options.some((value) => value.startsWith("project-only [project] *")),
+    );
+    assert.ok(options.some((value) => value.startsWith("scout *")));
+    assert.ok(options.some((value) => value.startsWith("standalone-global")));
+    assert.equal(
+      options.some((value) => value.startsWith("standalone-global *")),
+      false,
+    );
+    realFs.rmSync(join(PI_AGENTS_DIR, "project-only.md"), { force: true });
+    await command.handler("untrust", context);
+    await command.handler("definitions", context);
+    assert.equal(
+      selections.at(-1)?.some((value) => value.includes("project-only")),
+      false,
+    );
+  } finally {
+    pi?.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(project, { recursive: true, force: true });
+    for (const name of ["project-only.md", "standalone-global.md", "scout.md"])
+      realFs.rmSync(join(PI_AGENTS_DIR, name), { force: true });
+    setLeadEnvironment();
+  }
+});
+
+test("semantic result refs attach persisted output and preserve canonical file refs", async () => {
+  setLeadEnvironment();
+  const requestId = randomUUID();
+  const canonical = resultRef(requestId);
+  const resultFile = resultPath(requestId);
+  const resultText = [
+    'Agent result source: {"agent":"implementation","definition":"agent","cwd":"/repo","ompSessionId":"producer-session"}',
+    "persisted implementation review",
+  ].join("\n\n");
+  realFs.mkdirSync(resolve(resultFile, ".."), { recursive: true });
+  realFs.writeFileSync(resultFile, resultText, "utf8");
+  const entries: unknown[] = [
+    {
+      customType: "omp-herdsman-agent-result",
+      details: {
+        agentLabel: "implementation",
+        resultIndex: 1,
+        requestId,
+        resultRef: canonical,
+        status: "completed",
+      },
+    },
+  ];
+  const label = `selector-${randomUUID().slice(0, 8)}`;
+  let assignedText = "";
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_OMP_SESSION_ID,
+    undefined,
+    (text) => {
+      assignedText = text;
+    },
+  );
+  const pi = fakePi({ entries, exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        label,
+        task: "Review supplied implementation.",
+        files: ["result:implementation#1", canonical],
+      },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.match(assignedText, new RegExp(`<file name="${canonical}"`));
+    assert.match(
+      assignedText,
+      /Agent result source: \{"agent":"implementation","definition":"agent","cwd":"\/repo","ompSessionId":"producer-session"\}/,
+    );
+    assert.match(assignedText, /persisted implementation review/);
+    assert.equal(
+      assignedText.match(new RegExp(`<file name="${canonical}"`, "g"))?.length,
+      1,
+      "semantic and canonical refs supplied through files should deduplicate in the existing pipeline",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(resultFile, { force: true });
+  }
+});
+
+test("semantic result refs resolve only on the active branch", async () => {
+  setLeadEnvironment();
+  const requestId = randomUUID();
+  const resultEntry = {
+    customType: "omp-herdsman-agent-result",
+    details: {
+      agentLabel: "implementation",
+      resultIndex: 2,
+      requestId,
+      resultRef: resultRef(requestId),
+      status: "completed",
+    },
+  };
+  const entries: unknown[] = [resultEntry];
+  const pi = fakePi({ entries });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        task: "must not start",
+        files: ["result:implementation#2"],
+      },
+      undefined,
+      undefined,
+      fakeContext(entries, []),
+    );
+    assert.equal(result.details.error.category, "target_not_found");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+    const malformed = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        task: "must not start",
+        files: ["result:implementation#01"],
+      },
+      undefined,
+      undefined,
+      fakeContext(entries, []),
+    );
+    assert.equal(malformed.details.error.category, "invalid_request");
+    assert.equal(
+      malformed.details.error.message,
+      "Invalid result ref: result:implementation#01. Copy the exact result ref shown by the agent completion.",
+    );
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("conflicting duplicate result mappings fail closed", async () => {
+  setLeadEnvironment();
+  const firstRequestId = randomUUID();
+  const secondRequestId = randomUUID();
+  const entries: unknown[] = [
+    {
+      customType: "omp-herdsman-agent-result",
+      details: {
+        agentLabel: "implementation",
+        resultIndex: 1,
+        requestId: firstRequestId,
+        resultRef: resultRef(firstRequestId),
+        status: "completed",
+      },
+    },
+    {
+      customType: "omp-herdsman-agent-result",
+      details: {
+        agentLabel: "implementation",
+        resultIndex: 1,
+        requestId: secondRequestId,
+        resultRef: resultRef(secondRequestId),
+        status: "completed",
+      },
+    },
+  ];
+  const pi = fakePi({ entries });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        task: "must not guess",
+        files: ["result:implementation#1"],
+      },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(result.details.error.category, "target_ambiguous");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("managed agent validates project definitions before publishing state", async () => {
+  const mailbox = setAgentEnvironment("project-validation-agent");
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-agent-project-"),
+  );
+  realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+  realFs.writeFileSync(
+    join(project, ".omp", "agents", "broken.md"),
+    '---\nname: broken-parent\nagents: ["missing-child"]\n---\nbroken',
+  );
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "project-parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "project-parent",
+      },
+    },
+  ]) as any;
+  context.cwd = project;
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    assert.equal(readAgentState(mailbox), undefined);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("trusted same-cwd project assignment does not escalate tool approval", async () => {
+  setLeadEnvironment();
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-assign-same-cwd-"),
+  );
+  realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+  realFs.writeFileSync(
+    join(project, ".omp", "agents", "project-only.md"),
+    "---\nname: project-only\n---\nproject",
+  );
+  const startArgs: string[][] = [];
+  const startup = startupExecutor(
+    "release-review",
+    () => DEFAULT_OMP_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    (args) => startArgs.push(args),
+    project,
+    AGENT_ID,
+    true,
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.cwd = project;
+  updateConfig("approvedProjects", [realFs.realpathSync(project)]);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "project-only",
+        label: "release-review",
+        task: "same cwd",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      result.details.ok,
+      true,
+      JSON.stringify({ result: result.details, entries: pi.entries }),
+    );
+    assert.ok(!startArgs[0]?.includes("--approve"));
+    assert.ok(!startArgs[0]?.includes("--auto-approve"));
+    assert.ok(!startArgs[0]?.includes("--yolo"));
+    const tool = pi.tools.find((candidate) => candidate.name === "agent");
+    const rendered = tool.renderCall(
+      { action: "steer", agent: "release-review", message: "Continue." },
+      { expanded: false, isPartial: false },
+      {
+        fg: (_color: string, value: string) => value,
+        bold: (text: string) => text,
+      },
+    );
+    assert.match(
+      rendered.render(160).join("\n"),
+      /release-review · project-only/,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+  await (async () => {
+    setLeadEnvironment();
+    const project = realFs.mkdtempSync(
+      join(tmpdir(), "omp-herdsman-assign-symlink-cwd-"),
+    );
+    const projectLink = `${project}-link`;
+    realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+    realFs.writeFileSync(
+      join(project, ".omp", "agents", "project-only.md"),
+      "---\nname: project-only\n---\nproject",
+    );
+    realFs.symlinkSync(project, projectLink);
+    const startArgs: string[][] = [];
+    const startup = startupExecutor(
+      "project-only",
+      () => DEFAULT_OMP_SESSION_ID,
+      undefined,
+      undefined,
+      false,
+      (args) => startArgs.push(args),
+      project,
+      AGENT_ID,
+      true,
+    );
+    const pi = fakePi({ exec: startup.exec });
+    registerExtension!(pi.pi as never);
+    const context = fakeContext() as any;
+    context.cwd = projectLink;
+    updateConfig("approvedProjects", [realFs.realpathSync(projectLink)]);
+    try {
+      const result = await pi.tools[0].execute(
+        "id",
+        { action: "delegate", definition: "project-only", task: "symlink cwd" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(
+        result.details.ok,
+        true,
+        JSON.stringify({ result: result.details, entries: pi.entries }),
+      );
+      assert.ok(!startArgs[0]?.includes("--approve"));
+      assert.ok(!startArgs[0]?.includes("--auto-approve"));
+      assert.ok(!startArgs[0]?.includes("--yolo"));
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(startup.mailbox);
+      realFs.rmSync(projectLink, { force: true });
+      realFs.rmSync(project, { recursive: true, force: true });
+    }
+  })();
+});
+
+test("untrusted assignments omit project approval", async () => {
+  setLeadEnvironment();
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-approval-untrusted-"),
+  );
+  realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+  const startArgs: string[][] = [];
+  const startup = startupExecutor(
+    "agent",
+    () => DEFAULT_OMP_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    (args) => startArgs.push(args),
+    project,
+    AGENT_ID,
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.cwd = project;
+  context.isProjectTrusted = () => false;
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        task: "untrusted",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(startArgs[0]?.includes("--approve"), false);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("project-only Definitions edits create a global override", async () => {
+  setLeadEnvironment();
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-project-edit-"),
+  );
+  const projectPath = join(project, ".omp", "agents", "project-only.md");
+  const original = "---\nname: project-only\n---\nproject policy\n";
+  realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+  realFs.writeFileSync(projectPath, original);
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const context = fakeContext() as any;
+  context.cwd = project;
+  updateConfig("approvedProjects", [realFs.realpathSync(project)]);
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAll: () => [{ provider: "provider", id: "edited-model" }],
+    getAvailable: () => [{ provider: "provider", id: "edited-model" }],
+  };
+  let selection = 0;
+  context.ui.select = async (_label: string, options: string[]) => {
+    switch (selection++) {
+      case 0:
+        return options.find((option) => option.includes("project-only"));
+      case 1:
+        return options.find((option) => option.startsWith("Model"));
+      case 2:
+        return "edited-model";
+      default:
+        return undefined;
+    }
+  };
+  try {
+    await command.handler("definitions", context);
+    const globalPath = join(PI_AGENTS_DIR, "project-only.md");
+    assert.equal(realFs.readFileSync(projectPath, "utf8"), original);
+    assert.match(
+      realFs.readFileSync(globalPath, "utf8"),
+      /^model: provider\/edited-model$/m,
+    );
+    const effective = discoverAgent("project-only", { projectRoot: project });
+    assert.equal(effective.frontmatter.model, "provider/edited-model");
+    assert.equal(effective.projectSource, projectPath);
+    assert.equal(effective.overrideSource, globalPath);
+    realFs.rmSync(globalPath, { force: true });
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(project, { recursive: true, force: true });
+    realFs.rmSync(join(PI_AGENTS_DIR, "project-only.md"), { force: true });
+  }
+});
+
+test("same-cwd managed parents resolve project children", async () => {
+  setAgentEnvironment("project-parent", ["project-child"]);
+  const project = realFs.mkdtempSync(
+    join(tmpdir(), "omp-herdsman-parent-project-"),
+  );
+  realFs.mkdirSync(join(project, ".omp", "agents"), { recursive: true });
+  realFs.writeFileSync(
+    join(project, ".omp", "agents", "project-parent.md"),
+    '---\nname: project-parent\nagents: ["project-child"]\n---\nparent',
+  );
+  realFs.writeFileSync(
+    join(project, ".omp", "agents", "project-child.md"),
+    "---\nname: project-child\n---\nchild",
+  );
+  process.env.OMP_HERDSMAN_AGENT_DEFINITION = "project-parent";
+  const parent = { ...managedState("project-parent"), cwd: project };
+  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  resetAgentMailbox(parentMailbox);
+  writeAgentState(parentMailbox, parent);
+  const lifecycle = delegatedLifecycleExecutor(parent, [], project);
+  const pi = fakePi({ exec: lifecycle.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "project-parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "project-parent",
+      },
+    },
+  ]) as any;
+  context.cwd = project;
+  updateConfig("approvedProjects", [realFs.realpathSync(project)]);
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const started = await pi.tools[0].execute(
+      "start",
+      {
+        action: "delegate",
+        definition: "project-child",
+        label: "project-child",
+        task: "delegate project child work",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(started.details.ok, true, JSON.stringify(started.details));
+    const childState = readAgentState(
+      agentMailboxPath(WORKSPACE, "project-child"),
+    );
+    assert.equal(childState?.ownerSessionId, parent.ompSessionId);
+    assert.equal(childState?.cwd, project);
+    const child = discoverAgent("project-child", { projectRoot: project });
+    assert.equal(
+      child.projectSource,
+      join(project, ".omp", "agents", "project-child.md"),
+    );
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "project-child"));
+    realFs.rmSync(project, { recursive: true, force: true });
+    setLeadEnvironment();
+  }
+});
+
+test("parent controller readiness and allowlist fail closed", async () => {
+  setAgentEnvironment("delegating-parent", ["child"]);
+  process.env.OMP_HERDSMAN_AGENT_DEFINITION = "parent";
+  const parent = managedState("delegating-parent");
+  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  resetAgentMailbox(parentMailbox);
+  writeAgentState(parentMailbox, parent);
+  const files = [
+    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
+    ["child.md", "---\nname: child\n---\nchild\n"],
+    ["other.md", "---\nname: other\n---\nother\n"],
+  ];
+  for (const [name, content] of files)
+    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const context = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "parent",
+      },
+    },
+  ]);
+  const pi = fakePi({ exec: agentControllerExecutor(parent) });
+  registerExtension!(pi.pi as never);
+  const tool = pi.tools[0];
+  try {
+    const beforeInit = await tool.execute(
+      "id",
+      { action: "delegate", definition: "child", task: "before init" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(beforeInit.details.error.category, "target_not_found");
+    assert.equal(pi.calls.length, 0);
+
+    const listBeforeInit = await tool.execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(listBeforeInit.details.error.category, "target_not_found");
+    assert.equal(pi.calls.length, 0);
+
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+
+    const unauthorized = await tool.execute(
+      "id",
+      { action: "delegate", definition: "other", task: "not allowed" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(unauthorized.details.error.category, "invalid_request");
+    assert.equal(unauthorized.details.error.message, "Invalid agent input");
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    resetAgentMailbox(parentMailbox);
+    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
+  }
+
+  setAgentEnvironment("conflicting-parent", ["child"]);
+  process.env.OMP_HERDSMAN_AGENT_DEFINITION = "parent";
+  const conflict = managedState("conflicting-parent");
+  const conflictMailbox = agentMailboxPath(WORKSPACE, conflict.agentLabel);
+  resetAgentMailbox(conflictMailbox);
+  writeAgentState(conflictMailbox, {
+    ...conflict,
+    runId: "11111111-1111-4111-8111-111111111111",
+  });
+  for (const [name, content] of files)
+    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const failing = fakePi({ exec: agentControllerExecutor(conflict) });
+  registerExtension!(failing.pi as never);
+  const failingContext = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "parent",
+      },
+    },
+  ]);
+  try {
+    for (const handler of failing.events.get("session_start") ?? [])
+      await handler(undefined, failingContext);
+    const rejected = await failing.tools[0].execute(
+      "id",
+      { action: "delegate", definition: "child", task: "conflicting state" },
+      undefined,
+      undefined,
+      failingContext,
+    );
+    assert.equal(rejected.details.error.category, "target_not_found");
+    assert.equal(
+      failing.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    for (const handler of failing.events.get("session_shutdown") ?? [])
+      handler();
+    resetAgentMailbox(conflictMailbox);
+    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
+  }
+});
+
+test("parent list hides disabled allowed definitions", async () => {
+  setAgentEnvironment("listing-parent", ["enabled-child", "disabled-child"]);
+  const files = [
+    ["enabled-child.md", "---\nname: enabled-child\n---\nchild\n"],
+    [
+      "disabled-child.md",
+      "---\nname: disabled-child\nenabled: false\n---\nchild\n",
+    ],
+  ];
+  for (const [name, content] of files)
+    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const pi = fakePi({
+    exec: agentControllerExecutor(managedState("listing-parent")),
+  });
+  registerExtension!(pi.pi as never);
+  const entries = pi.entries;
+  const context = fakeAgentContext(entries);
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const listed = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.deepEqual(
+      (listed.details.agent_definitions as { name: string }[]).map(
+        ({ name }) => name,
+      ),
+      ["enabled-child"],
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    for (const [name] of files)
+      realFs.rmSync(join(PI_AGENTS_DIR, name), { force: true });
+  }
+});
+
+test("parent list omits unrelated unknown mailbox diagnostics", async () => {
+  setAgentEnvironment("recovery-parent-no-self-get", ["child"]);
+  process.env.OMP_HERDSMAN_AGENT_DEFINITION = "parent";
+  const parent = managedState("recovery-parent-no-self-get");
+  const child = {
+    ...managedState(
+      "recovered-child",
+      undefined,
+      recoveryIdentity("recovered-child"),
+    ),
+    ownerSessionId: parent.ompSessionId,
+    ompSessionId: CHILD_SESSION_ID,
+    ompSessionFile: "/tmp/recovered-child.jsonl",
+  };
+  const mailboxes = [parent, child].map((state) =>
+    agentMailboxPath(WORKSPACE, state.agentLabel),
+  );
+  const unknownMailbox = agentMailboxPath(
+    "unrelated-workspace",
+    "unrelated-agent",
+  );
+  for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+  writeAgentState(mailboxes[0], parent);
+  writeAgentState(mailboxes[1], child);
+  realFs.mkdirSync(unknownMailbox, { recursive: true });
+  realFs.writeFileSync(join(unknownMailbox, "state.json"), "{malformed");
+  const files = [
+    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
+    ["child.md", "---\nname: child\n---\nchild\n"],
+  ];
+  for (const [name, content] of files)
+    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const getTargets: string[] = [];
+  const base = agentControllerExecutor(parent, [child]);
+  const pi = fakePi({
+    exec: (command, args, options) => {
+      const result = base(command, args, options);
+      if (command === "herdr" && args[0] === "agent" && args[1] === "get")
+        getTargets.push(args[2]!);
+      return result;
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "parent",
+      },
+    },
+  ]);
+
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+
+    assert.deepEqual(getTargets, [child.paneId]);
+    const listed = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(listed.details.ok, true, JSON.stringify(listed.details));
+    assert.deepEqual(
+      (listed.details.agents as { agent?: string }[])
+        .map((agent) => agent.agent)
+        .filter((agent): agent is string => agent !== undefined),
+      [child.agentLabel],
+    );
+    assert.equal(
+      (listed.details.agents as { state?: string }[]).some(
+        (agent) => agent.state === "unknown",
+      ),
+      false,
+    );
+    assert.doesNotMatch(
+      (listed.content[0] as { text: string }).text,
+      /diagnostic:/,
+    );
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+    realFs.rmSync(unknownMailbox, { recursive: true, force: true });
+    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
+  }
+});
+
+test("foreign-workspace mailbox is ignored by recovery and list", async () => {
+  setLeadEnvironment();
+  const label = "cross-workspace-agent";
+  const identity = recoveryIdentity(label);
+  const current = managedState(label, undefined, identity);
+  const foreign: ManagedAgentState = {
+    ...current,
+    workspaceId: "foreign-workspace",
+    paneId: "foreign-pane",
+    ompSessionFile: "/tmp/foreign-workspace-agent.jsonl",
+  };
+  const currentMailbox = agentMailboxPath(WORKSPACE, label);
+  const foreignMailbox = agentMailboxPath(foreign.workspaceId, label);
+  resetAgentMailbox(currentMailbox);
+  resetAgentMailbox(foreignMailbox);
+  writeAgentState(currentMailbox, current);
+  writeAgentState(foreignMailbox, foreign);
+  const entries: unknown[] = [];
+  const lifecycle = cascadeExecutor([current]);
+  const pi = fakePi({ entries, exec: lifecycle.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+
+    const listed = await pi.tools[0].execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(listed.details.ok, true, JSON.stringify(listed.details));
+    assert.deepEqual(
+      (listed.details.agents as { agent?: string }[])
+        .map((agent) => agent.agent)
+        .filter((agent): agent is string => agent !== undefined),
+      [label],
+    );
+    assert.equal(
+      entries.some(
+        (entry: any) => entry.customType === "omp_herdsman_recovery_error",
+      ),
+      false,
+    );
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    resetAgentMailbox(currentMailbox);
+    resetAgentMailbox(foreignMailbox);
+  }
+});
+
+test("parent controls only direct children and enforces session allowlists", async () => {
+  setAgentEnvironment("ownership-parent", ["child"]);
+  process.env.OMP_HERDSMAN_AGENT_DEFINITION = "parent";
+  const parent = managedState("ownership-parent");
+  const child = {
+    ...managedState(
+      "ownership-child",
+      undefined,
+      recoveryIdentity("ownership-child"),
+    ),
+    ownerSessionId: parent.ompSessionId,
+    ompSessionId: CHILD_SESSION_ID,
+    ompSessionFile: join(testTmpRoot, "ownership-child.jsonl"),
+  };
+  const activeRequestId = randomUUID();
+  const workingChild = {
+    ...managedState(
+      "ownership-working-child",
+      activeRequestId,
+      recoveryIdentity("ownership-working-child"),
+    ),
+    ownerSessionId: parent.ompSessionId,
+    ompSessionId: "11111111-1111-4111-8111-111111111111",
+    ompSessionFile: join(testTmpRoot, "ownership-working-child.jsonl"),
+  };
+  const sibling = {
+    ...managedState(
+      "ownership-sibling",
+      undefined,
+      recoveryIdentity("ownership-sibling"),
+    ),
+    ownerSessionId: LEAD_SESSION_ID,
+    ompSessionId: "22222222-2222-4222-8222-222222222222",
+    ompSessionFile: join(testTmpRoot, "ownership-sibling.jsonl"),
+  };
+  const mailboxes = [parent, child, workingChild, sibling].map((state) =>
+    agentMailboxPath(WORKSPACE, state.agentLabel),
+  );
+  for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+  writeAgentState(mailboxes[0], parent);
+  writeAgentState(mailboxes[1], child);
+  writeAgentState(mailboxes[2], workingChild);
+  writeAgentState(mailboxes[3], sibling);
+  const files = [
+    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
+    ["child.md", "---\nname: child\n---\nchild\n"],
+    ["other.md", "---\nname: other\n---\nother\n"],
+  ];
+  for (const [name, content] of files)
+    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+  const entries = [
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "parent",
+        label: process.env.OMP_HERDSMAN_LABEL ?? "parent",
+      },
+    },
+  ];
+  const pi = fakePi({
+    exec: agentControllerExecutor(parent, [child, workingChild, sibling]),
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext(entries);
+  const resumePath = join(testTmpRoot, "ownership-resume.jsonl");
+  realFs.writeFileSync(resumePath, "{}", "utf8");
+  nativeSessions.set("ownership-resume", {
+    id: "33333333-3333-4333-8333-333333333333",
+    path: resumePath,
+    cwd: testTmpRoot,
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: "33333333-3333-4333-8333-333333333333",
+          definition: "other",
+          label: "other",
+        },
+      },
+    ],
+  });
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const listed = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.deepEqual(
+      (listed.details.agents as { agent: string }[])
+        .map((agent) => agent.agent)
+        .sort(),
+      [child.agentLabel, workingChild.agentLabel],
+    );
+
+    const steered = await pi.tools[0].execute(
+      "steer",
+      {
+        action: "steer",
+        agent: workingChild.agentLabel,
+        message: "steer direct child",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(steered.details.ok, true);
+    const siblingResult = await pi.tools[0].execute(
+      "sibling",
+      { action: "steer", agent: sibling.agentLabel, message: "wrong owner" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(siblingResult.details.error.category, "target_not_found");
+    assert.equal(
+      pi.calls.some(
+        (args) =>
+          args[0] === "agent" &&
+          args[1] === "prompt" &&
+          args[2] === sibling.paneId,
+      ),
+      false,
+    );
+
+    const resumed = await pi.tools[0].execute(
+      "resume",
+      {
+        action: "continue",
+        session: resumePath,
+        task: "wrong definition",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(resumed.details.error.category, "invalid_request");
+    assert.match(resumed.details.error.message, /not allowed/);
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    nativeSessions.delete("ownership-resume");
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
+    realFs.rmSync(resumePath, { force: true });
+  }
+});
+
+test("list retains durable agents whose physical identity is not exact", async () => {
+  setLeadEnvironment();
+  const validLabel = "valid-list-agent";
+  const invalidLabel = "invalid-list-agent";
+  const valid = recoveryIdentity(validLabel);
+  const invalid = {
+    ...recoveryIdentity(invalidLabel),
+    ompSessionId: "11111111-1111-4111-8111-111111111111",
+  };
+  const validMailbox = agentMailboxPath(WORKSPACE, validLabel);
+  const invalidMailbox = agentMailboxPath(WORKSPACE, invalidLabel);
+  resetAgentMailbox(validMailbox);
+  resetAgentMailbox(invalidMailbox);
+  writeAgentState(validMailbox, managedState(validLabel, undefined, valid));
+  writeAgentState(
+    invalidMailbox,
+    managedState(invalidLabel, undefined, invalid),
+  );
+  nativeSessions.set(invalid.ompSessionId, {
+    id: invalid.ompSessionId,
+    path: invalid.ompSessionFile,
+    entries: [],
+  });
+  nativeSessions.set(valid.ompSessionId, {
+    id: valid.ompSessionId,
+    path: valid.ompSessionFile,
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: valid.ompSessionId,
+          definition: "agent",
+          label: "agent",
+        },
+      },
+    ],
+  });
+  const pi = fakePi({
+    exec: (command, args) => {
+      if (command === "herdr" && args[0] === "--version")
+        return { stdout: "0.8.0", stderr: "", code: 0 };
+      if (command === "herdr" && isApiSnapshot(args))
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              snapshot: {
+                agents: [
+                  {
+                    name: "unmanaged-agent",
+                    agent_status: "idle",
+                    workspace_id: WORKSPACE,
+                    pane_id: "unmanaged-pane",
+                    cwd: "/tmp",
+                  },
+                  {
+                    name: herdrAlias(invalidLabel),
+                    agent_status: "idle",
+                    workspace_id: WORKSPACE,
+                    pane_id: invalid.paneId,
+                    cwd: "/tmp",
+                    agent_session: {
+                      source: "herdr:omp",
+                      agent: "omp",
+                      kind: "id",
+                      value: DEFAULT_OMP_SESSION_ID,
+                    },
+                  },
+                  {
+                    name: herdrAlias(validLabel),
+                    agent_status: "idle",
+                    workspace_id: WORKSPACE,
+                    pane_id: valid.paneId,
+                    cwd: "/tmp",
+                    agent_session: {
+                      source: "herdr:omp",
+                      agent: "omp",
+                      kind: "id",
+                      value: valid.ompSessionId,
+                    },
+                    agent_definition: "wrong-herdr-definition",
+                  },
+                ],
+                panes: [
+                  {
+                    pane_id: "unmanaged-pane",
+                    workspace_id: WORKSPACE,
+                    cwd: "/tmp",
+                  },
+                  {
+                    pane_id: invalid.paneId,
+                    workspace_id: WORKSPACE,
+                    cwd: "/tmp",
+                  },
+                  {
+                    pane_id: valid.paneId,
+                    workspace_id: WORKSPACE,
+                    cwd: "/tmp",
+                  },
+                ],
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      if (command === "herdr" && isPaneList(args))
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              panes: [
+                {
+                  pane_id: "unmanaged-pane",
+                  workspace_id: WORKSPACE,
+                  agent: "unmanaged-agent",
+                  agent_status: "unknown",
+                },
+                {
+                  pane_id: invalid.paneId,
+                  workspace_id: WORKSPACE,
+                  agent: invalidLabel,
+                  agent_status: "idle",
+                },
+                {
+                  pane_id: valid.paneId,
+                  workspace_id: WORKSPACE,
+                  agent: validLabel,
+                  agent_status: "idle",
+                },
+              ],
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  });
+  try {
+    registerExtension!(pi.pi as never);
+    const result = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    const agents = (
+      result.details as { agents: Array<Record<string, unknown>> }
+    ).agents;
+    assert.deepEqual(
+      agents
+        .filter((agent) => typeof agent.agent === "string")
+        .map((agent) => agent.agent)
+        .sort(),
+      [invalidLabel, validLabel].sort(),
+    );
+    const invalidAgent = agents.find((agent) => agent.agent === invalidLabel);
+    const validAgent = agents.find((agent) => agent.agent === validLabel);
+    assert.ok(invalidAgent);
+    assert.ok(validAgent);
+    assert.equal(invalidAgent.state, "unknown");
+    assert.deepEqual(invalidAgent.available_actions, []);
+    assert.equal(validAgent.agent_definition, "agent");
+    assert.equal(validAgent.managed, true);
+  } finally {
+    nativeSessions.delete(invalid.ompSessionId);
+    nativeSessions.delete(valid.ompSessionId);
+    resetAgentMailbox(validMailbox);
+    resetAgentMailbox(invalidMailbox);
+  }
+});
+
+test("list projects an unreadable current mailbox as non-actionable unknown", async () => {
+  setLeadEnvironment();
+  const mailbox = agentMailboxPath(WORKSPACE, "unreadable-list-agent");
+  realFs.mkdirSync(mailbox, { recursive: true });
+  realFs.writeFileSync(join(mailbox, "state.json"), "x".repeat(70 * 1024));
+  const pi = fakePi({
+    exec: (_command, args) =>
+      isAgentList(args) || isApiSnapshot(args)
+        ? {
+            stdout: JSON.stringify({
+              id: AGENT_ID,
+              result: { agents: [], snapshot: { agents: [], panes: [] } },
+            }),
+            stderr: "",
+            code: 0,
+          }
+        : { stdout: "{}", stderr: "", code: 0 },
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.agents.length, 1);
+    assert.deepEqual(
+      { ...result.details.agents[0], diagnostic: undefined },
+      {
+        state: "unknown",
+        available_actions: [],
+        managed: true,
+        diagnostic: undefined,
+      },
+    );
+    assert.match(
+      result.details.agents[0].diagnostic,
+      /Mailbox state unavailable: .*Mailbox record is too large/,
+    );
+    assert.match(
+      (result.content[0] as { text: string }).text,
+      /diagnostic: Mailbox state unavailable: .*Mailbox record is too large/,
+    );
+    assert.doesNotMatch(
+      (result.content[0] as { text: string }).text,
+      /session:|pane:/,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(mailbox, { recursive: true, force: true });
+  }
+});
+
+test("assignment session resolution accepts exact paths and UUIDs only", async () => {
+  const session = {
+    id: "018f2f2e-7b13-7abc-8def-0123456789ab",
+    path: join(homedir(), "native-resume.jsonl"),
+    cwd: join(homedir(), "saved-agent"),
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: "018f2f2e-7b13-7abc-8def-0123456789ab",
+          definition: "reviewer",
+          label: "review-fix",
+        },
+      },
+    ],
+  };
+  nativeSessions.clear();
+  nativeSessions.set(session.id, session);
+  const context = fakeContext() as any;
+  context.cwd = homedir();
+  const byPath = await resolveAssignmentSession(context, session.path);
+  assert.deepEqual(byPath, {
+    path: session.path,
+    id: session.id,
+    definition: "reviewer",
+    label: "review-fix",
+    cwd: session.cwd,
+  });
+  const byId = await resolveAssignmentSession(context, session.id);
+  assert.deepEqual(byId, byPath);
+  const byTilde = await resolveAssignmentSession(
+    context,
+    "~/native-resume.jsonl",
+  );
+  assert.deepEqual(byTilde, byPath);
+  await assert.rejects(
+    resolveAssignmentSession(context, "11111111"),
+    /prefixes are not allowed/,
+  );
+  nativeSessions.set("duplicate", {
+    ...session,
+    path: "/tmp/native-resume-2.jsonl",
+  });
+  await assert.rejects(
+    resolveAssignmentSession(context, session.id),
+    /ambiguous/,
+  );
+  const missing = {
+    id: "018f2f2e-7b13-7abc-8def-0123456789ab",
+    path: join(homedir(), "missing-identity.jsonl"),
+    cwd: homedir(),
+    entries: [],
+  };
+  nativeSessions.clear();
+  nativeSessions.set(missing.id, missing);
+  await assert.rejects(
+    resolveAssignmentSession(context, missing.path),
+    /missing omp-herdsman-agent-definition entry/,
+  );
+  nativeSessions.clear();
+});
+
+test("context retirement rejects managed session continuation only when enabled", async () => {
+  const sessionId = "018f2f2e-7b13-7abc-8def-0123456789ae";
+  const session = {
+    id: sessionId,
+    path: join(homedir(), "retired-managed.jsonl"),
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId, definition: "agent", label: "retired-agent" },
+      },
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-context-retired",
+        data: { sessionId },
+      },
+    ],
+  };
+  nativeSessions.clear();
+  nativeSessions.set(sessionId, session);
+  try {
+    updateConfig("contextRetirement", undefined);
+    await assert.rejects(
+      resolveAssignmentSession(fakeContext(), session.path),
+      /retired after context pressure/,
+    );
+    updateConfig("contextRetirement", false);
+    assert.deepEqual(
+      await resolveAssignmentSession(fakeContext(), session.path),
+      {
+        path: session.path,
+        id: sessionId,
+        definition: "agent",
+        label: "retired-agent",
+        cwd: resolve("/tmp"),
+      },
+    );
+  } finally {
+    updateConfig("contextRetirement", undefined);
+    nativeSessions.clear();
+  }
+});
+
+test("context retirement guards managed forks without changing ordinary forks", async () => {
+  setLeadEnvironment();
+  const retiredId = "018f2f2e-7b13-7abc-8def-0123456789af";
+  const retiredPath = join(homedir(), "retired-fork-source.jsonl");
+  const ordinaryId = "018f2f2e-7b13-7abc-8def-0123456789b0";
+  const ordinaryPath = join(homedir(), "ordinary-fork-source.jsonl");
+  const identityEntry = (sessionId: string, label: string) => ({
+    type: "custom",
+    customType: "omp-herdsman-agent-definition",
+    data: { sessionId, definition: "agent", label },
+  });
+  nativeSessions.clear();
+  nativeSessions.set(retiredId, {
+    id: retiredId,
+    path: retiredPath,
+    cwd: "/tmp",
+    entries: [
+      identityEntry(retiredId, "retired-fork-agent"),
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-context-retired",
+        data: { sessionId: retiredId },
+      },
+    ],
+  });
+  nativeSessions.set(ordinaryId, {
+    id: ordinaryId,
+    path: ordinaryPath,
+    cwd: "/tmp",
+    entries: [],
+  });
+  const runDelegate = async (
+    source: string,
+    label: string,
+    enabled: boolean,
+  ): Promise<any> => {
+    updateConfig("contextRetirement", enabled);
+    const startup = startupExecutor(label, () => DEFAULT_OMP_SESSION_ID);
+    const pi = fakePi({ exec: startup.exec });
+    registerExtension!(pi.pi as never);
+    try {
+      return await pi.tools[0].execute(
+        "id",
+        {
+          action: "delegate",
+          definition: "agent",
+          label,
+          fork: source,
+          task: "review the fork source",
+        },
+        undefined,
+        undefined,
+        fakeContext([ownershipResult(retiredId)]),
+      );
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(startup.mailbox);
+    }
+  };
+  try {
+    const rejected = await runDelegate(
+      retiredPath,
+      "retired-fork-target",
+      true,
+    );
+    assert.equal(rejected.details.error.category, "invalid_request");
+    assert.match(
+      rejected.details.error.message,
+      /retired after context pressure/,
+    );
+
+    const disabled = await runDelegate(
+      retiredPath,
+      "disabled-fork-target",
+      false,
+    );
+    assert.equal(disabled.details.ok, true, JSON.stringify(disabled.details));
+
+    const ordinary = await runDelegate(
+      ordinaryPath,
+      "ordinary-fork-target",
+      true,
+    );
+    assert.equal(ordinary.details.ok, true, JSON.stringify(ordinary.details));
+  } finally {
+    updateConfig("contextRetirement", undefined);
+    nativeSessions.clear();
+  }
+});
+
+test("session continuation inherits the saved label without an override", async () => {
+  const label = "resume-stable";
+  const run = async () => {
+    setLeadEnvironment();
+    nativeSessions.clear();
+    const sourceId = randomUUID();
+    const source = {
+      id: sourceId,
+      path: join(tmpdir(), `session-delegate-${randomUUID()}.jsonl`),
+      cwd: "/tmp",
+      entries: [
+        {
+          type: "custom",
+          customType: "omp-herdsman-agent-definition",
+          data: { sessionId: sourceId, definition: "agent", label },
+        },
+      ],
+    };
+    realFs.writeFileSync(source.path, "{}", "utf8");
+    nativeSessions.set(source.id, source);
+    const startup = startupExecutor(label, () => DEFAULT_OMP_SESSION_ID);
+    const pi = fakePi({ exec: startup.exec });
+    const context = fakeContext([ownershipResult(source.id)]) as any;
+    context.model = { provider: "continue-provider", id: "continue-model" };
+    context.thinkingLevel = "high";
+    registerExtension!(pi.pi as never);
+    try {
+      const result = await pi.tools[0].execute(
+        "id",
+        {
+          action: "continue",
+          session: source.path,
+          task: "continue with the saved label",
+        },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      assert.equal(result.details.agent, label);
+      assert.equal(
+        readAgentState(agentMailboxPath(WORKSPACE, label))?.agentLabel,
+        label,
+      );
+      const start = pi.calls.find(
+        (args) => args[0] === "agent" && args[1] === "start",
+      )!;
+      assert.ok(start);
+      assert.equal(start.includes("--model"), false);
+      assert.equal(start.includes("--thinking"), false);
+      assert.equal(
+        start[start.indexOf("--session") + 1],
+        realFs.realpathSync(source.path),
+      );
+      assert.equal(start.includes("--fork"), false);
+      return result;
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      nativeSessions.clear();
+      resetAgentMailbox(startup.mailbox);
+      realFs.rmSync(source.path, { force: true });
+    }
+  };
+
+  const first = await run();
+  assert.equal(first.details.agent, label);
+  const reused = await run();
+  assert.equal(reused.details.agent, label);
+});
+
+test("session continuation keeps explicit definition execution overrides", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const definition = `continue-override-${randomUUID().slice(0, 8)}`;
+  const label = `${definition}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${definition}.md`);
+  const sourceId = randomUUID();
+  const sourcePath = join(
+    tmpdir(),
+    `session-continue-override-${sourceId}.jsonl`,
+  );
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${definition}\nmodel: explicit/provider\nthinking: low\n---\ncontinue\n`,
+  );
+  realFs.writeFileSync(sourcePath, "{}", "utf8");
+  nativeSessions.set(sourceId, {
+    id: sourceId,
+    path: sourcePath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: sourceId, definition, label },
+      },
+    ],
+  });
+  const startup = startupExecutor(label, () => DEFAULT_OMP_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext([ownershipResult(sourceId)]) as any;
+  context.model = { provider: "controller-provider", id: "controller-model" };
+  context.thinkingLevel = "high";
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      { action: "continue", session: sourcePath, task: "continue" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    const start = pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.equal(start[start.indexOf("--model") + 1], "explicit/provider");
+    assert.equal(start[start.indexOf("--thinking") + 1], "low");
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sourcePath, { force: true });
+  }
+});
+
+test("session continuation rejects label overrides and occupied inherited labels", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const invalidPi = fakePi();
+  registerExtension!(invalidPi.pi as never);
+  try {
+    const invalidRequest = {
+      action: "continue",
+      session: "/tmp/session.jsonl",
+      label: "Invalid_Label",
+      task: "reject the label",
+    } as const;
+    assert.equal(
+      Value.Check(invalidPi.tools[0].parameters, invalidRequest),
+      false,
+    );
+    const invalid = await invalidPi.tools[0].execute(
+      "id",
+      invalidRequest,
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(invalid.details.error.category, "invalid_request");
+    assert.equal(invalidPi.calls.length, 0);
+  } finally {
+    invalidPi.events.get("session_shutdown")?.[0]();
+  }
+
+  setLeadEnvironment();
+  const label = "resume-occupied";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, managedState(label));
+  nativeSessions.set(DEFAULT_OMP_SESSION_ID, {
+    id: DEFAULT_OMP_SESSION_ID,
+    path: "/tmp/registered-agent.jsonl",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: DEFAULT_OMP_SESSION_ID,
+          definition: "agent",
+          label,
+        },
+      },
+    ],
+  });
+  const source = {
+    id: randomUUID(),
+    path: join(tmpdir(), `session-occupied-${randomUUID()}.jsonl`),
+    cwd: "/tmp",
+  };
+  realFs.writeFileSync(source.path, "{}", "utf8");
+  nativeSessions.set(source.id, {
+    ...source,
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: source.id, definition: "agent", label },
+      },
+    ],
+  });
+  const baseExec = leadExec(label, "idle", DEFAULT_OMP_SESSION_ID);
+  const pi = fakePi({
+    exec: (command, args, options) =>
+      command === "herdr" && args[0] === "tab" && args[1] === "create"
+        ? {
+            stdout: JSON.stringify({
+              id: AGENT_ID,
+              result: {
+                tab: { tab_id: "occupied-test-tab" },
+                root_pane: { pane_id: "occupied-test-pane" },
+              },
+            }),
+            stderr: "",
+            code: 0,
+          }
+        : baseExec(command, args, options),
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "continue",
+        session: source.path,
+        task: "must not fall back to another label",
+      },
+      undefined,
+      undefined,
+      fakeContext([ownershipResult(source.id)]),
+    );
+    assert.equal(result.details.error.category, "agent_label_exists");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(source.path, { force: true });
+  }
+});
+
+test("registered agent revalidates input mutated after tool_call", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  const input = {
+    action: "delegate",
+    definition: "agent",
+    task: "initially valid",
+  };
+  try {
+    const toolCall = pi.events.get("tool_call")?.[0];
+    assert.ok(toolCall);
+    assert.equal(
+      await toolCall({ toolName: "agent", input }, context),
+      undefined,
+    );
+    input.task = "";
+    const blocked = await toolCall({ toolName: "agent", input }, context);
+    assert.equal(blocked?.block, true);
+    assert.equal(blocked?.reason, "Invalid agent input");
+    const result = await pi.tools[0].execute(
+      "id",
+      input,
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.equal(result.details.error.message, "Invalid agent input");
+    assert.equal(result.details.error.operation, "delegate");
+    assert.equal(result.details.error.details, undefined);
+    assert.equal(pi.calls.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("public assignment normalizes invalid and unknown session sources", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const pi = fakePi({
+    exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }),
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    for (const [field, value, diagnostic] of [
+      ["session", "11111111", /prefixes are not allowed/],
+      [
+        "session",
+        "11111111-1111-4111-8111-111111111111",
+        /no assignment session found/,
+      ],
+      ["fork", "11111111", /prefixes are not allowed/],
+      [
+        "fork",
+        "22222222-2222-4222-8222-222222222222",
+        /no assignment session found/,
+      ],
+    ] as const) {
+      const result = await pi.tools[0].execute(
+        "id",
+        {
+          action: field === "session" ? "continue" : "delegate",
+          task: "resolve the source",
+          ...(field === "session"
+            ? { session: value }
+            : { definition: "agent", fork: value }),
+        },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(result.details.ok, false, JSON.stringify(result.details));
+      assert.equal(result.details.error.category, "invalid_request");
+      if (field === "session")
+        assert.equal(result.details.error.operation, "continue");
+      assert.match(result.details.error.message, diagnostic);
+    }
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+  }
+});
+
+test("session assignment rejects the controller's active session", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const session = {
+    id: LEAD_SESSION_ID,
+    path: join(testTmpRoot, "lead.jsonl"),
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: LEAD_SESSION_ID,
+          definition: "agent",
+          label: "agent",
+        },
+      },
+    ],
+  };
+  realFs.writeFileSync(session.path, "{}", "utf8");
+  nativeSessions.set(session.id, session);
+  const pi = fakePi({
+    exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }),
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      { action: "continue", session: session.path, task: "same session" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.equal(result.details.error.operation, "continue");
+    assert.match(result.details.error.message, /currently active OMP session/);
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    nativeSessions.clear();
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("public assignment preserves session source open failures", async () => {
+  setLeadEnvironment();
+  const session = {
+    id: "018f2f2e-7b13-7abc-8def-0123456789af",
+    path: join(homedir(), "assignment-open-failure.jsonl"),
+    cwd: "/tmp",
+    entries: [],
+  };
+  nativeSessions.set(session.id, session);
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  const openOperationError = new OperationError({
+    category: "internal_failure",
+    message: "session dependency failed",
+    operation: "session-open-test",
+    rollbackOccurred: false,
+    retryAttempted: false,
+  });
+  support.sessionOpenError = openOperationError;
+  try {
+    const structured = await pi.tools[0].execute(
+      "id",
+      {
+        action: "continue",
+        session: session.path,
+        task: "continue the saved session",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(structured.details.error, openOperationError.detail);
+
+    const internalError = new Error("permission denied while opening session");
+    support.sessionOpenError = internalError;
+    await assert.rejects(
+      pi.tools[0].execute(
+        "id",
+        {
+          action: "continue",
+          session: session.path,
+          task: "continue the saved session",
+        },
+        undefined,
+        undefined,
+        context,
+      ),
+      (error) => error === internalError,
+    );
+  } finally {
+    support.sessionOpenError = undefined;
+    nativeSessions.clear();
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("assignment session rejects unusable saved cwd headers without mutation", async () => {
+  setLeadEnvironment();
+  for (const [name, cwd] of [
+    ["missing", undefined],
+    ["empty", ""],
+  ] as const) {
+    const id = randomUUID();
+    const label = `assignment-session-cwd-${name}-${id}`;
+    const path = `/tmp/${id}.jsonl`;
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    assert.equal(realFs.existsSync(mailbox), false);
+    nativeSessions.clear();
+    nativeSessions.set(id, { id, path, cwd });
+    const pi = fakePi({
+      exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }),
+    });
+    registerExtension!(pi.pi as never);
+    const context = fakeContext();
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "continue",
+        session: path,
+        task: "continue the saved session",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.equal(result.details.error.rollbackOccurred, false);
+    assert.match(result.details.error.message, /no non-empty cwd/);
+    assert.deepEqual(pi.calls, []);
+    assert.equal(realFs.existsSync(mailbox), false);
+    assert.deepEqual(pi.entries, []);
+    pi.events.get("session_shutdown")?.[0]();
+  }
+  nativeSessions.clear();
+  await (async () => {
+    setLeadEnvironment();
+    const source = {
+      id: "018f2f2e-7b13-7abc-8def-0123456789ac",
+      path: join(homedir(), "fork-lead.jsonl"),
+      entries: [],
+    };
+    nativeSessions.clear();
+    nativeSessions.set(source.id, source);
+    try {
+      const expected = {
+        path: source.path,
+        id: source.id,
+      };
+      assert.deepEqual(
+        await resolveManagedSession(fakeContext(), source.path),
+        expected,
+      );
+      assert.deepEqual(
+        await resolveManagedSession(fakeContext(), source.id),
+        expected,
+      );
+    } finally {
+      nativeSessions.clear();
+    }
+  })();
+});
+
+test("agent assignment uses only an explicit exact fork source", async () => {
+  setLeadEnvironment();
+  const name = `fork-prompt-${randomUUID().slice(0, 8)}`;
+  const source = {
+    id: "018f2f2e-7b13-7abc-8def-0123456789ad",
+    path: join(homedir(), "explicit-fork-source.jsonl"),
+    entries: [],
+  };
+  nativeSessions.set(source.id, source);
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const promptPath = join(PI_AGENT_ROOT, `${name}-prompt.md`);
+  realFs.writeFileSync(promptPath, "current fork prompt");
+  writePromptDefinition(definitionPath, name, promptPath);
+  const launched: { args: string[]; contents: string[] }[] = [];
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_OMP_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    (args) =>
+      launched.push({ args: [...args], contents: promptLaunchContents(args) }),
+  );
+  const pi = fakePi({ exec: startup.exec, thinkingLevel: "medium" });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.model = { provider: "fork-provider", id: "fork-model" };
+  context.thinkingLevel = "medium";
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: name,
+        label,
+        fork: source.path,
+        task: "review the forked session",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    const start = pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.equal(start[start.indexOf("--fork") + 1], source.path);
+    assert.equal(start.includes("--session"), false);
+    assert.equal(
+      start[start.indexOf("--model") + 1],
+      "fork-provider/fork-model",
+    );
+    assert.equal(start[start.indexOf("--thinking") + 1], "medium");
+    assert.equal(launched[0].contents.length, 3);
+    assert.match(launched[0].contents[0]!, /definition body/);
+    assert.match(launched[0].contents[0]!, /current fork prompt/);
+    assert.match(launched[0].contents[1]!, /ask_owner/);
+    assert.deepEqual(
+      start.filter(
+        (arg) => arg === "--system-prompt" || arg === "--append-system-prompt",
+      ),
+      ["--system-prompt", "--append-system-prompt", "--append-system-prompt"],
+    );
+    for (const path of promptLaunchPaths(launched[0].args))
+      assert.equal(realFs.existsSync(path), false, `prompt leaked: ${path}`);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(promptPath, { force: true });
+  }
+});
+
+test("managed historical sources require durable owner-side ancestry for continue and fork", async () => {
+  setLeadEnvironment();
+  const parentId = randomUUID();
+  const sourceId = randomUUID();
+  const sourcePath = join(testTmpRoot, `owned-source-${sourceId}.jsonl`);
+  realFs.writeFileSync(sourcePath, "{}", "utf8");
+  nativeSessions.clear();
+  nativeSessions.set(parentId, {
+    id: parentId,
+    path: join(testTmpRoot, `owner-${parentId}.jsonl`),
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: parentId, definition: "agent", label: "parent" },
+      },
+      ownershipResult(sourceId, parentId),
+    ],
+  });
+  const sourceEntries = [
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: { sessionId: sourceId, definition: "agent", label: "owned-source" },
+    },
+    ownershipResult(parentId, sourceId),
+  ];
+  nativeSessions.set(sourceId, {
+    id: sourceId,
+    path: sourcePath,
+    cwd: "/tmp",
+    entries: sourceEntries,
+  });
+  const parentProof = ownershipResult(parentId);
+  const pi = fakePi({ exec: () => ({ stdout: "0.8.0", stderr: "", code: 0 }) });
+  registerExtension!(pi.pi as never);
+  const request = async (
+    action: "continue" | "delegate",
+    selector: string,
+    entries: unknown[],
+  ) =>
+    pi.tools[0].execute(
+      "id",
+      action === "continue"
+        ? { action, session: selector, task: "follow up" }
+        : { action, definition: "agent", fork: selector, task: "fork" },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+  try {
+    for (const action of ["continue", "delegate"] as const) {
+      for (const selector of [sourceId, sourcePath]) {
+        const recipient = await request(action, selector, [
+          ownershipResult(randomUUID()),
+        ]);
+        assert.equal(recipient.details.error.category, "invalid_request");
+        assert.match(recipient.details.error.message, /ownership tree/);
+        const broken = await request(action, selector, [
+          {
+            ...parentProof,
+            details: {
+              ...parentProof.details,
+              ownerSessionId: randomUUID(),
+            },
+          },
+        ]);
+        assert.equal(broken.details.error.category, "invalid_request");
+      }
+    }
+    const cycle = await request("delegate", sourceId, []);
+    assert.equal(cycle.details.error.category, "invalid_request");
+    sourceEntries.pop();
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+  }
+
+  try {
+    for (const proof of [[parentProof], [ownershipResult(sourceId)]]) {
+      if (proof[0] !== parentProof) nativeSessions.delete(parentId);
+      for (const action of ["continue", "delegate"] as const) {
+        const startup = startupExecutor(
+          "owned-source",
+          () => DEFAULT_OMP_SESSION_ID,
+        );
+        const owner = fakePi({ exec: startup.exec });
+        registerExtension!(owner.pi as never);
+        try {
+          const result = await owner.tools[0].execute(
+            "id",
+            action === "continue"
+              ? { action, session: sourceId, task: "follow up" }
+              : {
+                  action,
+                  definition: "agent",
+                  label: "owned-source",
+                  fork: sourcePath,
+                  task: "fork",
+                },
+            undefined,
+            undefined,
+            fakeContext(proof),
+          );
+          assert.equal(result.details.ok, true, JSON.stringify(result.details));
+        } finally {
+          owner.events.get("session_shutdown")?.[0]();
+          startup.stopMailboxConsumer();
+          resetAgentMailbox(startup.mailbox);
+        }
+      }
+    }
+  } finally {
+    nativeSessions.clear();
+    realFs.rmSync(sourcePath, { force: true });
+  }
+});
+
+test("copied fork result history does not invalidate the original owner edge", async () => {
+  setLeadEnvironment();
+  const parentId = randomUUID();
+  const childId = randomUUID();
+  const forkId = randomUUID();
+  const childPath = join(testTmpRoot, `fork-history-child-${childId}.jsonl`);
+  const parentEntries = [
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: { sessionId: parentId, definition: "agent", label: "parent" },
+    },
+    ownershipResult(childId, parentId),
+  ];
+  realFs.writeFileSync(childPath, "{}", "utf8");
+  nativeSessions.clear();
+  nativeSessions.set(parentId, {
+    id: parentId,
+    path: join(testTmpRoot, `fork-history-parent-${parentId}.jsonl`),
+    entries: parentEntries,
+  });
+  nativeSessions.set(forkId, {
+    id: forkId,
+    path: join(testTmpRoot, `fork-history-fork-${forkId}.jsonl`),
+    entries: [...parentEntries],
+  });
+  nativeSessions.set(childId, {
+    id: childId,
+    path: childPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: childId, definition: "agent", label: "child" },
+      },
+    ],
+  });
+  const startup = startupExecutor("child", () => DEFAULT_OMP_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      { action: "continue", session: childId, task: "follow up" },
+      undefined,
+      undefined,
+      fakeContext([ownershipResult(parentId)]),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+    nativeSessions.clear();
+    realFs.rmSync(childPath, { force: true });
+  }
+});
+
+test("historical continuation re-parenting preserves every valid ownership path", async () => {
+  setLeadEnvironment();
+  const parentId = randomUUID();
+  const childId = DEFAULT_OMP_SESSION_ID;
+  const outsiderId = randomUUID();
+  const childPath = join(testTmpRoot, `reparented-${childId}.jsonl`);
+  realFs.writeFileSync(childPath, "{}", "utf8");
+  const parentEntries = [
+    {
+      type: "custom",
+      customType: "omp-herdsman-agent-definition",
+      data: { sessionId: parentId, definition: "agent", label: "parent" },
+    },
+    ownershipResult(childId, parentId),
+  ];
+  const leadEntries = [ownershipResult(parentId)];
+  nativeSessions.clear();
+  nativeSessions.set(parentId, {
+    id: parentId,
+    path: join(testTmpRoot, `reparent-owner-${parentId}.jsonl`),
+    entries: parentEntries,
+  });
+  nativeSessions.set(childId, {
+    id: childId,
+    path: childPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: childId, definition: "agent", label: "child" },
+      },
+    ],
+  });
+  const request = async (
+    action: "continue" | "delegate",
+    entries: unknown[],
+    callerId = LEAD_SESSION_ID,
+  ) => {
+    const startup = startupExecutor("child", () => childId);
+    const pi = fakePi({ exec: startup.exec });
+    registerExtension!(pi.pi as never);
+    try {
+      const context = fakeContext(entries) as any;
+      context.sessionManager.getSessionId = () => callerId;
+      const result = await pi.tools[0].execute(
+        "id",
+        action === "continue"
+          ? { action, session: childId, task: "continue child" }
+          : {
+              action,
+              definition: "agent",
+              label: "child",
+              fork: childPath,
+              task: "fork child",
+            },
+        undefined,
+        undefined,
+        context,
+      );
+      if (result.details.ok && action === "continue")
+        assert.equal(result.details.session_id, childId);
+      return result;
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      startup.stopMailboxConsumer();
+      resetAgentMailbox(startup.mailbox);
+    }
+  };
+  try {
+    const first = await request("continue", leadEntries);
+    assert.equal(first.details.ok, true, JSON.stringify(first.details));
+    // The completed continuation delivers a new result for the same Pi ID
+    // directly to L, without erasing P's older child result.
+    leadEntries.push(ownershipResult(childId));
+    for (const action of ["continue", "delegate"] as const) {
+      const repeated = await request(action, leadEntries);
+      assert.equal(repeated.details.ok, true, JSON.stringify(repeated.details));
+      const unrelated = await request(action, [], outsiderId);
+      assert.equal(unrelated.details.error.category, "invalid_request");
+    }
+    const malformed = ownershipResult(childId, parentId);
+    (malformed.details as any).status = "unknown";
+    parentEntries.push(malformed);
+    assert.equal(
+      (await request("delegate", leadEntries)).details.error.category,
+      "invalid_request",
+    );
+    parentEntries.pop();
+    const childEntries = nativeSessions.get(childId)!.entries;
+    childEntries.push(ownershipResult(parentId, childId));
+    assert.equal(
+      (await request("continue", leadEntries)).details.error.category,
+      "invalid_request",
+    );
+  } finally {
+    nativeSessions.clear();
+    realFs.rmSync(childPath, { force: true });
+  }
+});
+
+test("ordinary Pi fork with copied managed history remains a delegate fork source", async () => {
+  setLeadEnvironment();
+  const parentId = randomUUID();
+  const forkId = randomUUID();
+  const forkPath = join(testTmpRoot, `copied-managed-fork-${forkId}.jsonl`);
+  nativeSessions.clear();
+  nativeSessions.set(forkId, {
+    id: forkId,
+    path: forkPath,
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: { sessionId: parentId, definition: "agent", label: "parent" },
+      },
+      ownershipResult(randomUUID(), parentId),
+    ],
+  });
+  const startup = startupExecutor(
+    "copied-fork-target",
+    () => DEFAULT_OMP_SESSION_ID,
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        label: "copied-fork-target",
+        fork: forkId,
+        task: "review the ordinary fork",
+      },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    const start = pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.equal(start[start.indexOf("--fork") + 1], forkPath);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+    nativeSessions.clear();
+  }
+});
+
+test("session assignment fails closed on duplicate live representations", async () => {
+  setLeadEnvironment();
+  const session = {
+    id: "018f2f2e-7b13-7abc-8def-0123456789ae",
+    path: join(testTmpRoot, "duplicate-live-session.jsonl"),
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "omp-herdsman-agent-definition",
+        data: {
+          sessionId: "018f2f2e-7b13-7abc-8def-0123456789ae",
+          definition: "agent",
+          label: "session-conflict-label",
+        },
+      },
+    ],
+  };
+  realFs.writeFileSync(session.path, "{}", "utf8");
+  nativeSessions.set(session.id, session);
+  const first = managedState(
+    "duplicate-live-one",
+    undefined,
+    recoveryIdentity("duplicate-live-one"),
+  );
+  const second = {
+    ...managedState(
+      "duplicate-live-two",
+      undefined,
+      recoveryIdentity("duplicate-live-two"),
+    ),
+    ompSessionId: session.id,
+    ompSessionFile: session.path,
+  };
+  first.ompSessionId = session.id;
+  first.ompSessionFile = session.path;
+  const mailboxes = [first, second].map((state) => {
+    const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, state);
+    return mailbox;
+  });
+  const pi = fakePi({
+    exec: (command, args) => {
+      if (command === "herdr" && args[0] === "--version")
+        return { stdout: "0.8.0", stderr: "", code: 0 };
+      if (command === "herdr" && (isAgentList(args) || isApiSnapshot(args)))
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              agents: [agentFromState(first), agentFromState(second)],
+              snapshot: {
+                agents: [agentFromState(first), agentFromState(second)],
+                panes: [first, second].map((state) => ({
+                  pane_id: state.paneId,
+                  workspace_id: state.workspaceId,
+                  cwd: state.cwd,
+                  agent_session: {
+                    source: "herdr:omp",
+                    agent: "omp",
+                    kind: "id",
+                    value: state.ompSessionId,
+                  },
+                })),
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "continue",
+        session: session.path,
+        task: "continue the ambiguous session",
+      },
+      undefined,
+      undefined,
+      fakeContext([ownershipResult(session.id)]),
+    );
+    assert.equal(result.details.error.category, "target_ambiguous");
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+    realFs.rmSync(session.path, { force: true });
+  }
+});
+
+test("registered delegate validates duplicate agents, selectors, and timeout before lifecycle use", async () => {
+  setLeadEnvironment();
+  const label = "duplicate-agent";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, managedState(label, undefined, identity));
+  const duplicate = fakePi({
+    exec: leadExec(
+      label,
+      "idle",
+      identity.ompSessionId,
+      undefined,
+      identity.ompSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(duplicate.pi as never);
+  await duplicate.events.get("session_start")![0](undefined, fakeContext());
+  const tool = duplicate.tools[0];
+  assert.equal(tool.name, "agent");
+  assert.equal(
+    duplicate.tools.some((candidate) => candidate.name === "subagent"),
+    false,
+  );
+  assert.equal(duplicate.commandOptions.has("agents"), true);
+  assert.equal(duplicate.commandOptions.has("subagents"), false);
+  const context = fakeContext();
+  const duplicateResult = await tool.execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      label: "duplicate-agent",
+      task: "duplicate task",
+    },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(duplicateResult.details.error.category, "agent_label_exists");
+  assert.equal(
+    duplicate.calls.some((args) => args.includes("--env")),
+    false,
+  );
+
+  const invalidTimeout = await tool.execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      timeoutMs: 5000,
+      task: "invalid timeout task",
+    },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(invalidTimeout.details.error.category, "invalid_request");
+  assert.equal(invalidTimeout.details.error.message, "Invalid agent input");
+  const missingAgentTask = await tool.execute(
+    "id",
+    { action: "delegate", agent: "session-agent" },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(missingAgentTask.details.error.category, "invalid_request");
+  for (const legacy of [
+    { action: "start", definition: "agent", task: "legacy start" },
+    {
+      action: "resume",
+      session: "/tmp/session.jsonl",
+      task: "legacy resume",
+    },
+    { action: "assign", agent: label, task: "legacy assign" },
+  ]) {
+    const result = await tool.execute(
+      "id",
+      legacy,
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.equal(result.details.error.message, "Invalid agent input");
+  }
+  const substitutedResume = await tool.execute(
+    "id",
+    {
+      action: "delegate",
+      session: "/tmp/missing-session.jsonl",
+      definition: "implementer",
+    },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(substitutedResume.details.error.category, "invalid_request");
+  duplicate.events.get("session_shutdown")?.[0]();
+});
+
+test("registered delegate ignores an unrelated agent and forwards its child budget", async () => {
+  setLeadEnvironment();
+  const label = "minimum-timeout-agent";
+  const startup = startupExecutor(label, () => DEFAULT_OMP_SESSION_ID);
+  const pi = fakePi({
+    thinkingLevel: "high",
+    exec: (command, args, options) => {
+      const result = startup.exec(command, args, options);
+      if (command === "herdr" && isAgentList(args)) {
+        const value = JSON.parse(result.stdout);
+        const envelope = value.result ?? value;
+        envelope.agents.push({
+          herdr_kind: "omp",
+          workspace_id: WORKSPACE,
+          pane_id: "unmanaged-lead-pane",
+          cwd: "/tmp",
+        });
+        return { ...result, stdout: JSON.stringify(value) };
+      }
+      return result;
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const originalDateNow = Date.now;
+  Date.now = () => 1_000_000;
+  const context = fakeContext() as any;
+  context.model = { provider: "controller-provider", id: "controller-model" };
+  try {
+    const result = await pi.tools[0].execute(
+      "id",
+      {
+        action: "delegate",
+        definition: "agent",
+        label,
+        task: "minimum timeout task",
+        timeoutMs: 6000,
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true);
+    const start = pi.calls.findIndex(
+      (args) => args[0] === "agent" && args[1] === "start",
+    );
+    assert.ok(start >= 0);
+    assert.equal(start >= 0 && pi.calls[start]!.includes("--model"), true);
+    assert.equal(
+      pi.calls[start]![pi.calls[start]!.indexOf("--model") + 1],
+      "controller-provider/controller-model",
+    );
+    assert.equal(
+      pi.calls[start]![pi.calls[start]!.indexOf("--thinking") + 1],
+      "high",
+    );
+    const childTimeout = Number(
+      pi.calls[start]![pi.calls[start]!.indexOf("--timeout") + 1],
+    );
+    assert.equal(childTimeout, 4000);
+    // The command outlives Herdr's readiness deadline by the diagnostic window,
+    // so Herdr's structured failure is reported instead of this command's kill.
+    assert.equal(pi.execOptions[start]?.timeout, 6000);
+  } finally {
+    Date.now = originalDateNow;
+    pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("registered delegate protects a live mailbox owned by another owner", async () => {
+  setLeadEnvironment();
+  const label = "reviewer";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = {
+    ...managedState(label, undefined, defaultFixtureIdentity),
+    ownerSessionId: "owner-a",
+  };
+  writeAgentState(mailbox, state);
+  writeRequest(mailbox, {
+    version: 4,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: state.paneId,
+    kind: "task",
+    text: "preserve me",
+    createdAt: Date.now(),
+  });
+  writeResult(mailbox, {
+    version: 4,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: state.paneId,
+    status: "completed",
+    text: "preserve this result",
+    completedAt: Date.now(),
+  });
+  const before = readFileSync(`${mailbox}/state.json`, "utf8");
+  const requestBefore = readFileSync(
+    `${mailbox}/request-${REQUEST_ID}.json`,
+    "utf8",
+  );
+  const resultBefore = readFileSync(
+    `${mailbox}/result-${REQUEST_ID}.json`,
+    "utf8",
+  );
+  const pi = fakePi({
+    exec: leadExec(label, "idle", DEFAULT_OMP_SESSION_ID),
+  });
+  registerExtension!(pi.pi as never);
+  const tool = pi.tools[0];
+  const result = await tool.execute(
+    "id",
+    { action: "delegate", definition: "agent", label, task: "preserve me" },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(result.details.error.category, "agent_label_exists");
+  assert.equal(
+    pi.calls.some((args) => args.includes("--placement")),
+    false,
+  );
+  assert.equal(readFileSync(`${mailbox}/state.json`, "utf8"), before);
+  assert.equal(
+    readFileSync(`${mailbox}/request-${REQUEST_ID}.json`, "utf8"),
+    requestBefore,
+  );
+  assert.equal(
+    readFileSync(`${mailbox}/result-${REQUEST_ID}.json`, "utf8"),
+    resultBefore,
+  );
+  pi.events.get("session_shutdown")?.[0]();
+});
+
+test("fresh assignments do not reset an unacknowledged stale mailbox", async () => {
+  setLeadEnvironment();
+  const explicitLabel = "stale-explicit-agent";
+  const explicitMailbox = agentMailboxPath(WORKSPACE, explicitLabel);
+  const explicitState = managedState(explicitLabel);
+  const explicitRequestId = randomUUID();
+  writeAgentState(explicitMailbox, explicitState);
+  writeRequest(explicitMailbox, {
+    version: 4,
+    runId: explicitState.runId,
+    requestId: explicitRequestId,
+    ownerSessionId: explicitState.ownerSessionId,
+    workspaceId: explicitState.workspaceId,
+    agentLabel: explicitState.agentLabel,
+    paneId: explicitState.paneId,
+    kind: "task",
+    text: "preserve stale handoff",
+    createdAt: Date.now(),
+  });
+  const explicitStartup = startupExecutor(explicitLabel, () => null);
+  const explicitPi = fakePi({ exec: explicitStartup.exec });
+  registerExtension!(explicitPi.pi as never);
+  const explicit = await explicitPi.tools[0].execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      label: explicitLabel,
+      task: "must not reset stale handoff",
+    },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(explicit.details.error.category, "agent_label_exists");
+  assert.ok(readRequest(explicitMailbox, explicitRequestId));
+  assert.equal(
+    explicitPi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+    false,
+  );
+  explicitPi.events.get("session_shutdown")?.[0]();
+
+  const automaticLabel = "agent";
+  const automaticMailbox = agentMailboxPath(WORKSPACE, automaticLabel);
+  const automaticState = managedState(automaticLabel);
+  const automaticRequestId = randomUUID();
+  writeAgentState(automaticMailbox, automaticState);
+  writeRequest(automaticMailbox, {
+    version: 4,
+    runId: automaticState.runId,
+    requestId: automaticRequestId,
+    ownerSessionId: automaticState.ownerSessionId,
+    workspaceId: automaticState.workspaceId,
+    agentLabel: automaticState.agentLabel,
+    paneId: automaticState.paneId,
+    kind: "task",
+    text: "preserve automatic handoff",
+    createdAt: Date.now(),
+  });
+  const automaticStartup = startupExecutor(
+    automaticLabel + "-2",
+    () => DEFAULT_OMP_SESSION_ID,
+  );
+  const automaticPi = fakePi({ exec: automaticStartup.exec });
+  registerExtension!(automaticPi.pi as never);
+  const automatic = await automaticPi.tools[0].execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      task: "use the next safe label",
+    },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(automatic.details.ok, true, JSON.stringify(automatic.details));
+  assert.equal(automatic.details.agent, `${automaticLabel}-2`);
+  assert.ok(readRequest(automaticMailbox, automaticRequestId));
+  automaticPi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(automaticStartup.mailbox);
+  resetAgentMailbox(explicitMailbox);
+});
+
+test("request-only mailbox remnants reserve their labels", async () => {
+  setLeadEnvironment();
+  const explicitLabel = "request-only-explicit";
+  const explicitMailbox = agentMailboxPath(WORKSPACE, explicitLabel);
+  const explicitRequestId = randomUUID();
+  writeRequest(explicitMailbox, {
+    version: 4,
+    runId: AGENT_ID,
+    requestId: explicitRequestId,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: explicitLabel,
+    paneId: "request-only-pane",
+    kind: "task",
+    text: "retain this request-only remnant",
+    createdAt: Date.now(),
+  });
+  const explicitStartup = startupExecutor(
+    explicitLabel,
+    () => DEFAULT_OMP_SESSION_ID,
+  );
+  const explicitPi = fakePi({ exec: explicitStartup.exec });
+  registerExtension!(explicitPi.pi as never);
+  const explicit = await explicitPi.tools[0].execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      label: explicitLabel,
+      task: "must not reuse a request-only mailbox",
+    },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(explicit.details.error.category, "agent_label_exists");
+  assert.equal(
+    explicitPi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+    false,
+  );
+  explicitPi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(explicitMailbox);
+
+  setLeadEnvironment();
+  const automaticLabel = "agent";
+  const automaticMailbox = agentMailboxPath(WORKSPACE, automaticLabel);
+  const automaticRequestId = randomUUID();
+  writeRequest(automaticMailbox, {
+    version: 4,
+    runId: AGENT_ID,
+    requestId: automaticRequestId,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: automaticLabel,
+    paneId: "request-only-pane",
+    kind: "task",
+    text: "retain this request-only remnant",
+    createdAt: Date.now(),
+  });
+  const automaticStartup = startupExecutor(
+    `${automaticLabel}-2`,
+    () => DEFAULT_OMP_SESSION_ID,
+  );
+  const automaticPi = fakePi({ exec: automaticStartup.exec });
+  registerExtension!(automaticPi.pi as never);
+  const automatic = await automaticPi.tools[0].execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      task: "choose the next safe label",
+    },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(automatic.details.ok, true, JSON.stringify(automatic.details));
+  assert.equal(automatic.details.agent, `${automaticLabel}-2`);
+  assert.ok(readRequest(automaticMailbox, automaticRequestId));
+  automaticPi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(automaticStartup.mailbox);
+  resetAgentMailbox(automaticMailbox);
+});
+
+test("assignment retains its request when acknowledgement never arrives", async () => {
+  setLeadEnvironment();
+  const label = "ack-timeout-agent";
+  const startup = startupExecutor(label, () => DEFAULT_OMP_SESSION_ID);
+  startup.stopMailboxConsumer();
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 10).unref();
+  const pi = fakePi({
+    exec: startup.exec,
+  });
+  registerExtension!(pi.pi as never);
+  const result = await pi.tools[0].execute(
+    "id",
+    {
+      action: "delegate",
+      definition: "agent",
+      label,
+      task: "retain on timeout",
+    },
+    controller.signal,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(result.details.ok, false);
+  assert.equal(
+    realFs
+      .readdirSync(startup.mailbox)
+      .filter((name) => name.startsWith("request-") && name.endsWith(".json"))
+      .length,
+    1,
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(startup.mailbox);
+});
+
+test("registered lead exposes only explicit live controls", async () => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "lead-pane";
+  const label = "action-agent";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
+  const steerFile = join(testTmpRoot, `${label}-update.md`);
+  realFs.writeFileSync(steerFile, "steer evidence");
+  let steerSubmitted: RequestRecord | undefined;
+  const accepting = fakePi({
+    exec: leadExec(
+      label,
+      "working",
+      identity.ompSessionId,
+      (requestMailbox, marker) => {
+        const requestId = marker.slice("__OMP_HERDSMAN_AGENT_V4__:".length);
+        steerSubmitted = readRequest(requestMailbox, requestId);
+        const current = readAgentState(requestMailbox)!;
+        writeAgentState(requestMailbox, {
+          ...current,
+          lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
+          updatedAt: Date.now(),
+        });
+      },
+      identity.ompSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(accepting.pi as never);
+  assert.deepEqual(
+    accepting.tools.map((candidate) => candidate.name),
+    ["agent", "chief", "peer"],
+  );
+  assert.equal(
+    accepting.tools.some((candidate) => candidate.name === "subagent"),
+    false,
+  );
+  const tool = accepting.tools[0];
+  const context = fakeContext(accepting.entries);
+  await accepting.events.get("session_start")![0](
+    undefined,
+    fakeContext(accepting.entries),
+  );
+  const listed = await tool.execute(
+    "id",
+    { action: "list" },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.deepEqual(listed.details.agents[0].available_actions, [
+    "inspect",
+    "steer",
+    "interrupt",
+    "close",
+  ]);
+  const steer = await accepting.tools[0].execute(
+    "id",
+    { action: "steer", agent: label, message: "continue", files: [steerFile] },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(steer.details.ok, true);
+  assert.equal(steer.details.action, "steer");
+  assert.equal(steer.details.agent, label);
+  assert.equal(steer.details.session_id, identity.ompSessionId);
+  assert.equal(steer.details.assignment_request_id, REQUEST_ID);
+  assert.equal(steer.details.presentation_agent_definition, "agent");
+  assert.equal(steer.details.truncated, false);
+  assert.equal(steerSubmitted?.kind, "steer");
+  assert.match(steerSubmitted?.text ?? "", /steer evidence/);
+  assert.equal(steerSubmitted?.requestId, steer.details.request_id);
+  assert.match(
+    (steer.content[0] as { text: string }).text,
+    new RegExp(`Session: ${identity.ompSessionId}`),
+  );
+  assert.match(
+    (steer.content[0] as { text: string }).text,
+    /Assignment request: /,
+  );
+  const rendered = accepting.tools[0].renderResult(
+    { content: steer.content, details: steer.details },
+    { expanded: true, isPartial: false },
+    { fg: (_color: string, text: string) => text },
+    { args: { action: "steer", agent: label, message: "continue" } },
+  );
+  assert.match(rendered.text, new RegExp(`session: ${identity.ompSessionId}`));
+  assert.match(rendered.text, /assignment request: /);
+  let interruptSubmitted: RequestRecord | undefined;
+  const interruptPi = fakePi({
+    exec: leadExec(
+      label,
+      "working",
+      identity.ompSessionId,
+      (requestMailbox, marker) => {
+        const requestId = marker.slice("__OMP_HERDSMAN_AGENT_V4__:".length);
+        interruptSubmitted = readRequest(requestMailbox, requestId);
+        const current = readAgentState(requestMailbox)!;
+        writeAgentState(requestMailbox, {
+          ...current,
+          lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
+          updatedAt: Date.now(),
+        });
+      },
+      identity.ompSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(interruptPi.pi as never);
+  const interruptContext = fakeContext(interruptPi.entries);
+  await interruptPi.events.get("session_start")![0](
+    undefined,
+    interruptContext,
+  );
+  const interrupt = await interruptPi.tools[0].execute(
+    "interrupt",
+    {
+      action: "interrupt",
+      agent: label,
+      message: "Stop and use the fallback.",
+    },
+    undefined,
+    undefined,
+    interruptContext,
+  );
+  assert.equal(interrupt.details.ok, true);
+  assert.equal(interrupt.details.action, "interrupt");
+  assert.equal(interrupt.details.assignment_request_id, REQUEST_ID);
+  assert.equal(interruptSubmitted?.kind, "interrupt");
+  assert.equal(interruptSubmitted?.text, "Stop and use the fallback.");
+  interruptPi.events.get("session_shutdown")?.[0]();
+  accepting.events.get("session_shutdown")?.[0]();
+  realFs.rmSync(steerFile, { force: true });
+});
+
+test("successful controls persist their definition before runtime teardown", async () => {
+  for (const action of ["steer", "reply", "inspect"] as const) {
+    setLeadEnvironment();
+    const label = `persisted-${action}`;
+    const identity = recoveryIdentity(label);
+    const requestId = randomUUID();
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    const state = {
+      ...managedState(
+        label,
+        action === "inspect" ? undefined : requestId,
+        identity,
+      ),
+      agentDefinition: "agent",
+    };
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, state);
+    const askId = randomUUID();
+    if (action === "reply") {
+      writeAgentState(mailbox, { ...state, pendingAskId: askId });
+      writeAsk(mailbox, {
+        version: 4,
+        askId,
+        requestId,
+        runId: state.runId,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        ompSessionId: state.ompSessionId,
+        question: "Which provider should I use?",
+        createdAt: Date.now(),
+      });
+    }
+    let pi: ReturnType<typeof fakePi>;
+    let context = fakeContext();
+    let tornDown = false;
+    const teardown = () => {
+      if (tornDown) return;
+      tornDown = true;
+      for (const handler of pi.events.get("session_shutdown") ?? [])
+        handler(undefined, context);
+    };
+    const acknowledgeAndTearDown = (requestMailbox: string, marker: string) => {
+      const observedRequestId = marker.slice(
+        "__OMP_HERDSMAN_AGENT_V4__:".length,
+      );
+      const current = readAgentState(requestMailbox)!;
+      writeAgentState(requestMailbox, {
+        ...current,
+        lastAck: {
+          requestId: observedRequestId,
+          accepted: true,
+          acknowledgedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      });
+      teardown();
+    };
+    const baseExec = leadExec(
+      label,
+      "working",
+      identity.ompSessionId,
+      action === "inspect" ? undefined : acknowledgeAndTearDown,
+      identity.ompSessionId,
+      identity,
+    );
+    const exec = async (command: string, args: string[], options: any) => {
+      const result = await baseExec(command, args, options);
+      if (
+        action === "inspect" &&
+        command === "herdr" &&
+        args[0] === "agent" &&
+        args[1] === "get"
+      )
+        teardown();
+      return result;
+    };
+    pi = fakePi({ exec });
+    registerExtension!(pi.pi as never);
+    try {
+      await pi.events.get("session_start")![0](undefined, context);
+      const result = await pi.tools[0].execute(
+        action,
+        {
+          action,
+          agent: label,
+          ...(action !== "inspect" ? { message: "Continue." } : {}),
+        },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      assert.equal(result.details.presentation_agent_definition, "agent");
+      assert.doesNotMatch(
+        (result.content[0] as { text: string }).text,
+        /presentation_agent_definition/,
+      );
+    } finally {
+      teardown();
+      resetAgentMailbox(mailbox);
+    }
+  }
+});
+
+test("lead steers a blocked parent waiting for direct-child work", async () => {
+  setLeadEnvironment();
+  const parent = {
+    ...managedState(
+      "steerable-parent",
+      REQUEST_ID,
+      recoveryIdentity("steerable-parent"),
+    ),
+    ompSessionId: PARENT_SESSION_ID,
+    ompSessionFile: "/tmp/steerable-parent.jsonl",
+  };
+  const child = {
+    ...managedState(
+      "steerable-child",
+      randomUUID(),
+      recoveryIdentity("steerable-child"),
+    ),
+    ownerSessionId: parent.ompSessionId,
+    ompSessionId: CHILD_SESSION_ID,
+    ompSessionFile: "/tmp/steerable-child.jsonl",
+  };
+  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  const foreignChildMailbox = agentMailboxPath(
+    "foreign-steerable-workspace",
+    "foreign-steerable-child",
+  );
+  resetAgentMailbox(parentMailbox);
+  resetAgentMailbox(childMailbox);
+  resetAgentMailbox(foreignChildMailbox);
+  writeAgentState(parentMailbox, parent);
+  writeAgentState(childMailbox, child);
+  const childBefore = readAgentState(childMailbox);
+  const observedParent = { ...parent, activeRequestId: undefined };
+  let parentStatus: "idle" | "working" = "idle";
+  const base = agentControllerExecutor(observedParent, [child]);
+  const pi = fakePi({
+    exec: (command, args, options) => {
+      if (command === "herdr" && (isAgentList(args) || isApiSnapshot(args))) {
+        const liveParent = readAgentState(parentMailbox) ?? observedParent;
+        const liveChild = readAgentState(childMailbox) ?? child;
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              agents: [
+                agentFromState(liveParent, parentStatus),
+                agentFromState(
+                  liveChild,
+                  liveChild.activeRequestId ? "working" : "idle",
+                ),
+              ],
+              snapshot: {
+                agents: [
+                  agentFromState(liveParent, parentStatus),
+                  agentFromState(
+                    liveChild,
+                    liveChild.activeRequestId ? "working" : "idle",
+                  ),
+                ],
+                panes: [liveParent, liveChild].map((state) => ({
+                  pane_id: state.paneId,
+                  workspace_id: state.workspaceId,
+                  cwd: state.cwd,
+                  agent_session: {
+                    source: "herdr:omp",
+                    agent: "omp",
+                    kind: "id",
+                    value: state.ompSessionId,
+                  },
+                })),
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (
+        command === "herdr" &&
+        args[0] === "agent" &&
+        args[1] === "get" &&
+        args[2] === parent.paneId
+      )
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: {
+              agent: {
+                ...agentFromState(observedParent, parentStatus),
+                session_id: parent.ompSessionId,
+                session_path: parent.ompSessionFile,
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      return base(command, args, options);
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    const listed = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      listed.details.agents[0]?.state,
+      "blocked",
+      JSON.stringify(listed.details),
+    );
+    assert.ok(listed.details.agents[0].available_actions.includes("steer"));
+    const listedChild = (listed.details.agents as any[]).find(
+      (agent) => agent.agent === child.agentLabel,
+    );
+    assert.deepEqual(listedChild?.available_actions, []);
+
+    parentStatus = "working";
+    const workingParent = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(workingParent.details.agents[0].state, "working");
+    assert.ok(
+      workingParent.details.agents[0].available_actions.includes("steer"),
+    );
+    assert.ok(
+      workingParent.details.agents[0].available_actions.includes("interrupt"),
+    );
+    assert.equal(
+      listed.details.agents[0].available_actions.includes("interrupt"),
+      false,
+    );
+
+    parentStatus = "idle";
+    writeAgentState(childMailbox, {
+      ...child,
+      activeRequestId: undefined,
+      completedRequestId: undefined,
+    });
+    const noChildWork = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(noChildWork.details.agents[0].state, "settling");
+    assert.ok(
+      !noChildWork.details.agents[0].available_actions.includes("steer"),
+    );
+
+    writeAgentState(foreignChildMailbox, {
+      ...child,
+      workspaceId: "foreign-steerable-workspace",
+      agentLabel: "foreign-steerable-child",
+      activeRequestId: randomUUID(),
+    });
+    const foreignWorkspaceChild = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.ok(
+      !foreignWorkspaceChild.details.agents[0].available_actions.includes(
+        "steer",
+      ),
+    );
+    resetAgentMailbox(foreignChildMailbox);
+    writeAgentState(childMailbox, child);
+
+    writeAgentState(childMailbox, {
+      ...child,
+      ownerSessionId: "11111111-1111-4111-8111-111111111111",
+    });
+    const otherOwnerChild = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.ok(
+      !otherOwnerChild.details.agents[0].available_actions.includes("steer"),
+    );
+    writeAgentState(childMailbox, child);
+
+    writeAgentState(parentMailbox, {
+      ...parent,
+      activeRequestId: undefined,
+    });
+    const noParentAssignment = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.ok(
+      !noParentAssignment.details.agents[0].available_actions.includes("steer"),
+    );
+    writeAgentState(parentMailbox, parent);
+
+    const handoffRequestId = randomUUID();
+    writeRequest(parentMailbox, {
+      version: 4,
+      runId: parent.runId,
+      requestId: handoffRequestId,
+      ownerSessionId: parent.ownerSessionId,
+      workspaceId: parent.workspaceId,
+      agentLabel: parent.agentLabel,
+      paneId: parent.paneId,
+      kind: "task",
+      text: "pending handoff",
+      createdAt: Date.now(),
+    });
+    const handoffPending = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(handoffPending.details.agents[0].state, "settling");
+    assert.ok(
+      !handoffPending.details.agents[0].available_actions.includes("steer"),
+    );
+    removeRequest(parentMailbox, handoffRequestId);
+
+    const steered = await pi.tools[0].execute(
+      "steer",
+      { action: "steer", agent: parent.agentLabel, message: "continue" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(steered.details.ok, true, JSON.stringify(steered.details));
+    assert.equal(readAgentState(parentMailbox)?.activeRequestId, REQUEST_ID);
+    assert.deepEqual(readAgentState(childMailbox), childBefore);
+
+    writeAgentState(childMailbox, {
+      ...child,
+      activeRequestId: undefined,
+      completedRequestId: child.activeRequestId,
+    });
+    writeResult(childMailbox, {
+      version: 4,
+      runId: child.runId,
+      requestId: child.activeRequestId!,
+      ownerSessionId: child.ownerSessionId,
+      workspaceId: child.workspaceId,
+      agentLabel: child.agentLabel,
+      paneId: child.paneId,
+      status: "completed",
+      text: "child result",
+      completedAt: Date.now(),
+    });
+    assert.ok(readResult(childMailbox, child.activeRequestId!));
+    const completedChild = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(completedChild.details.agents[0].state, "blocked");
+    assert.ok(
+      completedChild.details.agents[0].available_actions.includes("steer"),
+    );
+    assert.equal(
+      readAgentState(childMailbox)?.completedRequestId,
+      child.activeRequestId,
+    );
+
+    const ownerAskId = randomUUID();
+    writeAsk(parentMailbox, {
+      version: 4,
+      askId: ownerAskId,
+      requestId: REQUEST_ID,
+      runId: parent.runId,
+      ownerSessionId: parent.ownerSessionId,
+      workspaceId: parent.workspaceId,
+      agentLabel: parent.agentLabel,
+      paneId: parent.paneId,
+      ompSessionId: parent.ompSessionId,
+      question: "owner clarification",
+      createdAt: Date.now(),
+    });
+    writeAgentState(parentMailbox, {
+      ...parent,
+      pendingAskId: ownerAskId,
+    });
+    const ownerAsk = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(ownerAsk.details.agents[0].state, "blocked");
+    assert.deepEqual(ownerAsk.details.agents[0].available_actions, [
+      "inspect",
+      "reply",
+    ]);
+    removeAsk(parentMailbox, ownerAskId);
+    writeAgentState(parentMailbox, parent);
+
+    writeAgentState(parentMailbox, {
+      ...parent,
+      activeRequestId: undefined,
+      completedRequestId: REQUEST_ID,
+    });
+    writeResult(parentMailbox, {
+      version: 4,
+      runId: parent.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: parent.ownerSessionId,
+      workspaceId: parent.workspaceId,
+      agentLabel: parent.agentLabel,
+      paneId: parent.paneId,
+      status: "completed",
+      text: "parent result while child result is pending",
+      completedAt: Date.now(),
+    });
+    const completionWithChild = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(completionWithChild.details.agents[0].state, "settling");
+    assert.ok(
+      !completionWithChild.details.agents[0].available_actions.includes(
+        "steer",
+      ),
+    );
+    writeAgentState(parentMailbox, parent);
+
+    removeResult(childMailbox, child.activeRequestId!);
+    assert.equal(
+      readAgentState(childMailbox)?.completedRequestId,
+      child.activeRequestId,
+    );
+    const completedChildWithoutResult = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      completedChildWithoutResult.details.agents[0].available_actions.includes(
+        "steer",
+      ),
+      false,
+    );
+
+    writeAgentState(parentMailbox, {
+      ...parent,
+      activeRequestId: undefined,
+      completedRequestId: REQUEST_ID,
+    });
+    writeResult(parentMailbox, {
+      version: 4,
+      runId: parent.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: parent.ownerSessionId,
+      workspaceId: parent.workspaceId,
+      agentLabel: parent.agentLabel,
+      paneId: parent.paneId,
+      status: "completed",
+      text: "parent result",
+      completedAt: Date.now(),
+    });
+    const ownCompletion = await pi.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(ownCompletion.details.agents[0].state, "settling");
+    assert.ok(
+      !ownCompletion.details.agents[0].available_actions.includes("steer"),
+    );
+    const rejected = await pi.tools[0].execute(
+      "steer",
+      { action: "steer", agent: parent.agentLabel, message: "late" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(rejected.details.error.category, "agent_busy");
+    assert.match(
+      rejected.details.error.message,
+      /not currently accepting steering/,
+    );
+
+    pi.events.get("session_shutdown")?.[0]();
+    const restarted = fakePi({
+      exec: (command, args, options) => {
+        if (
+          command === "herdr" &&
+          args[0] === "agent" &&
+          args[1] === "get" &&
+          args[2] === parent.paneId
+        )
+          return {
+            stdout: JSON.stringify({
+              id: AGENT_ID,
+              result: {
+                agent: {
+                  ...agentFromState(observedParent, parentStatus),
+                  session_id: parent.ompSessionId,
+                  session_path: parent.ompSessionFile,
+                },
+              },
+            }),
+            stderr: "",
+            code: 0,
+          };
+        return base(command, args, options);
+      },
+    });
+    registerExtension!(restarted.pi as never);
+    const restartedList = await restarted.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.ok(
+      !restartedList.details.agents[0].available_actions.includes("steer"),
+    );
+    restarted.events.get("session_shutdown")?.[0]();
+
+    writeAgentState(parentMailbox, parent);
+    writeAgentState(childMailbox, child);
+    const recoveredPositive = fakePi({ exec: base });
+    registerExtension!(recoveredPositive.pi as never);
+    const recoveredPositiveList = await recoveredPositive.tools[0].execute(
+      "list",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.ok(
+      recoveredPositiveList.details.agents[0].available_actions.includes(
+        "steer",
+      ),
+    );
+    recoveredPositive.events.get("session_shutdown")?.[0]();
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(childMailbox);
+    resetAgentMailbox(foreignChildMailbox);
+  }
+});
+
+test("acknowledgement state-write failures retain requests for durable retry", async () => {
+  const cases = [
+    {
+      name: "busy rejection",
+      kind: "task" as const,
+      isIdle: false,
+      activeRequestId: randomUUID(),
+      expected: {
+        accepted: false,
+        code: "busy" as const,
+        message: "Agent already has an active assignment",
+      },
+    },
+    {
+      name: "idle rejection",
+      kind: "steer" as const,
+      isIdle: true,
+      expected: {
+        accepted: false,
+        code: "idle" as const,
+        message: "Agent is not accepting steering",
+      },
+    },
+    {
+      name: "successful steer delivery",
+      kind: "steer" as const,
+      isIdle: false,
+      activeRequestId: randomUUID(),
+      expected: { accepted: true },
+    },
+    {
+      name: "failed steer delivery",
+      kind: "steer" as const,
+      isIdle: false,
+      activeRequestId: randomUUID(),
+      deliveryFailure: true,
+      expected: { accepted: true },
+    },
+  ] as const;
+
+  for (const [index, scenario] of cases.entries()) {
+    const label = `ack-retry-${index}`;
+    const mailbox = setAgentEnvironment(label);
+    const activeRequestId = scenario.activeRequestId;
+    writeAgentState(mailbox, managedState(label, activeRequestId));
+    const agent = fakePi();
+    registerExtension!(agent.pi as never);
+    const context = fakeAgentContext();
+    (context as any).isIdle = () => scenario.isIdle;
+    await agent.events.get("session_start")![0](undefined, context);
+    if (scenario.deliveryFailure)
+      agent.pi.sendUserMessage = () => {
+        throw new Error("injected steer delivery failure");
+      };
+
+    const started = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 4,
+      runId: started.runId,
+      requestId: randomUUID(),
+      ownerSessionId: started.ownerSessionId,
+      workspaceId: started.workspaceId,
+      agentLabel: started.agentLabel,
+      paneId: started.paneId,
+      kind: scenario.kind,
+      text: scenario.name,
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    support.failNextMailboxWrite = true;
+    const input = agent.events.get("input")![0];
+    assert.deepEqual(
+      input({ text: controlMarker(request.requestId) }, context),
+      { action: "handled" },
+    );
+    assert.equal(readAgentState(mailbox)?.lastAck, undefined);
+    assert.ok(readRequest(mailbox, request.requestId));
+    assert.equal(agent.sentUsers.length, 0);
+
+    assert.deepEqual(
+      input({ text: controlMarker(request.requestId) }, context),
+      scenario.expected.accepted
+        ? { action: "transform", text: request.text }
+        : { action: "handled" },
+    );
+    const acknowledged = readAgentState(mailbox)?.lastAck;
+    assert.equal(acknowledged?.requestId, request.requestId, scenario.name);
+    assert.equal(acknowledged?.accepted, scenario.expected.accepted);
+    assert.equal(acknowledged?.code, scenario.expected.code);
+    assert.equal(acknowledged?.message, scenario.expected.message);
+    if (scenario.expected.accepted)
+      assert.ok(readRequest(mailbox, request.requestId));
+    else assert.equal(readRequest(mailbox, request.requestId), undefined);
+    assert.equal(agent.sentUsers.length, 0);
+    agent.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("assignment status normalization fails closed safely", async () => {
+  const cases = [
+    {
+      suffix: "available",
+      status: "done" as const,
+      result: false,
+      expectedState: "settling",
+    },
+    {
+      suffix: "working",
+      status: "working" as const,
+      result: false,
+      expectedState: "unknown",
+    },
+    {
+      suffix: "pending",
+      status: "done" as const,
+      result: true,
+      expectedState: "settling",
+    },
+    {
+      suffix: "null-status",
+      status: "done" as const,
+      agentStatus: null,
+      result: false,
+      expectedState: "unknown",
+    },
+    {
+      suffix: "unsupported-status",
+      status: "done" as const,
+      agentStatus: "interactive",
+      result: false,
+      expectedState: "unknown",
+    },
+  ];
+  for (const scenario of cases) {
+    setLeadEnvironment();
+    const label = `status-${scenario.suffix}`;
+    const identity = recoveryIdentity(label);
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    const state = managedState(label, undefined, identity);
+    writeAgentState(mailbox, state);
+    if (scenario.result) {
+      state.completedRequestId = REQUEST_ID;
+      writeAgentState(mailbox, state);
+      writeResult(mailbox, {
+        version: 4,
+        runId: AGENT_ID,
+        requestId: REQUEST_ID,
+        ownerSessionId: LEAD_SESSION_ID,
+        workspaceId: WORKSPACE,
+        agentLabel: label,
+        paneId: identity.paneId,
+        status: "completed",
+        text: "pending",
+        completedAt: Date.now(),
+      });
+    }
+    const pi = fakePi({
+      exec: leadExec(
+        label,
+        scenario.status,
+        identity.ompSessionId,
+        (requestMailbox, marker) => {
+          const requestId = marker.slice("__OMP_HERDSMAN_AGENT_V4__:".length);
+          const current = readAgentState(requestMailbox)!;
+          writeAgentState(requestMailbox, {
+            ...current,
+            lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
+            updatedAt: Date.now(),
+          });
+        },
+        identity.ompSessionId,
+        identity,
+        true,
+        scenario.agentStatus,
+      ),
+    });
+    try {
+      registerExtension!(pi.pi as never);
+      const context = fakeContext();
+      const listed = await pi.tools[0].execute(
+        "list",
+        { action: "list" },
+        undefined,
+        undefined,
+        context,
+      );
+      const agents = (listed.details as { agents: any[] }).agents;
+      assert.equal(agents.length, 1);
+      assert.equal(agents[0].state, scenario.expectedState);
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+    }
+  }
+  await (async () => {
+    setLeadEnvironment();
+    const label = "mailbox-eligibility-agent";
+    const identity = recoveryIdentity(label);
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    const state = managedState(label, undefined, identity);
+    writeAgentState(mailbox, state);
+    const pi = fakePi({
+      exec: leadExec(
+        label,
+        "idle",
+        identity.ompSessionId,
+        (requestMailbox, marker) => {
+          const requestId = marker.slice("__OMP_HERDSMAN_AGENT_V4__:".length);
+          const current = readAgentState(requestMailbox)!;
+          writeAgentState(requestMailbox, {
+            ...current,
+            activeRequestId: requestId,
+            completedRequestId: undefined,
+            lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
+            updatedAt: Date.now(),
+          });
+        },
+        identity.ompSessionId,
+        identity,
+      ),
+    });
+    registerExtension!(pi.pi as never);
+    const context = fakeContext();
+    try {
+      const handoffRequestId = randomUUID();
+      writeRequest(mailbox, {
+        version: 4,
+        runId: state.runId,
+        requestId: handoffRequestId,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        kind: "task",
+        text: "recover this handoff",
+        createdAt: Date.now(),
+      });
+      await pi.events.get("session_start")![0](undefined, context);
+      const handoffList = await pi.tools[0].execute(
+        "id",
+        { action: "list" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(handoffList.details.agents[0].state, "settling");
+      assert.equal(
+        handoffList.details.agents[0].available_actions.includes("delegate"),
+        false,
+      );
+      removeRequest(mailbox, handoffRequestId);
+
+      const requestA = randomUUID();
+      writeAgentState(mailbox, {
+        ...state,
+        activeRequestId: requestA,
+      });
+      const activeList = await pi.tools[0].execute(
+        "id",
+        { action: "list" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(activeList.details.agents[0].state, "settling");
+      assert.equal(activeList.details.agents[0].active_request_id, requestA);
+      assert.equal(
+        activeList.details.agents[0].available_actions.includes("delegate"),
+        false,
+      );
+
+      writeAgentState(mailbox, {
+        ...state,
+        completedRequestId: requestA,
+      });
+      writeResult(mailbox, {
+        version: 4,
+        runId: state.runId,
+        requestId: requestA,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        status: "completed",
+        text: "done",
+        completedAt: Date.now(),
+      });
+      const completedList = await pi.tools[0].execute(
+        "id",
+        { action: "list" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(completedList.details.agents[0].state, "settling");
+      assert.equal(
+        completedList.details.agents[0].available_actions.includes("delegate"),
+        false,
+      );
+
+      removeResult(mailbox, requestA);
+      const settledList = await pi.tools[0].execute(
+        "id",
+        { action: "list" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(settledList.details.agents[0].state, "settling");
+      assert.deepEqual(settledList.details.agents[0].available_actions, [
+        "inspect",
+        "close",
+      ]);
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+    }
+  })();
+});
+
+test("rejects context injection before unsupported actions perform work", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const filesResult = await pi.tools[0].execute(
+    "id",
+    { action: "list", files: ["missing.txt"] },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(filesResult.details.error.category, "invalid_request");
+  assert.equal(pi.calls.length, 0);
+  const closeFilesResult = await pi.tools[0].execute(
+    "id",
+    { action: "close", agent: "agent", files: ["missing.txt"] },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(closeFilesResult.details.error.category, "invalid_request");
+  assert.equal(pi.calls.length, 0);
+});
+
+test("transcript projects persisted agent evidence without Herdr terminal reads", async () => {
+  setLeadEnvironment();
+  const label = "transcript-agent";
+  const identity = {
+    ...recoveryIdentity(label),
+    ompSessionFile: join(testTmpRoot, `${label}.jsonl`),
+  };
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  realFs.rmSync(identity.ompSessionFile, { force: true });
+  writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
+  const session = {
+    id: identity.ompSessionId,
+    path: identity.ompSessionFile,
+    contextEntries: [
+      {
+        type: "custom_message",
+        customType: "private-test",
+        content: "INTERNAL CUSTOM MESSAGE",
+        display: false,
+      },
+      {
+        type: "message",
+        message: { role: "system", content: "INTERNAL SYSTEM MESSAGE" },
+      },
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Inspect the controller path." }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "PRIVATE REASONING" },
+            { type: "text", text: "I will inspect the implementation." },
+            {
+              type: "toolCall",
+              id: "call-running",
+              name: "read",
+              arguments: { path: "extension/index.ts", limit: 100 },
+            },
+          ],
+          stopReason: "toolUse",
+        },
+      },
+    ],
+  };
+  const writeSession = (): void => {
+    const entries = session.contextEntries.map((entry, index) => ({
+      ...entry,
+      id: `entry-${index}`,
+      parentId: "parentId" in entry ? entry.parentId : index ? `entry-${index - 1}` : null,
+      timestamp: new Date().toISOString(),
+    }));
+    realFs.writeFileSync(
+      identity.ompSessionFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: identity.ompSessionId,
+          timestamp: new Date().toISOString(),
+          cwd: "/tmp",
+        }),
+        ...entries.map((entry) => JSON.stringify(entry)),
+      ].join("\n") + "\n",
+    );
+  };
+  nativeSessions.set(identity.ompSessionId, session);
+  const pi = fakePi({
+    exec: leadExec(
+      label,
+      "working",
+      identity.ompSessionId,
+      undefined,
+      identity.ompSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    const before = await pi.tools[0]!.execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(
+      before.details.agents[0].available_actions.includes("transcript"),
+      false,
+    );
+    const pending = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(pending.details.error.category, "agent_busy");
+    assert.match(
+      pending.details.error.message,
+      /Pi has not persisted this agent's session file/,
+    );
+    assert.equal(realFs.existsSync(identity.ompSessionFile), false);
+
+    writeSession();
+    const ready = await pi.tools[0]!.execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(
+      ready.details.agents[0].available_actions.includes("transcript"),
+      true,
+    );
+    const result = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(result.details.ok, true);
+    assert.equal(result.details.action, "transcript");
+    assert.equal(result.details.agent, label);
+    assert.equal(result.details.session_id, identity.ompSessionId);
+    assert.match(result.details.transcript, /Inspect the controller path/);
+    assert.match(
+      result.details.transcript,
+      /I will inspect the implementation/,
+    );
+    assert.match(result.details.transcript, /tool read:/);
+    assert.doesNotMatch(result.details.transcript, /PRIVATE REASONING/);
+    assert.doesNotMatch(result.details.transcript, /INTERNAL CUSTOM MESSAGE/);
+    assert.doesNotMatch(result.details.transcript, /INTERNAL SYSTEM MESSAGE/);
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "read"),
+      false,
+    );
+
+    session.contextEntries = [
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "original user evidence" }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "abandoned assistant evidence" }],
+        },
+      },
+      {
+        type: "message",
+        parentId: null,
+        message: { role: "user", content: [{ type: "text", text: "replacement user evidence" }] },
+      },
+    ];
+    writeSession();
+    const edited = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.match(edited.details.transcript, /replacement user evidence/);
+    assert.doesNotMatch(edited.details.transcript, /original user evidence/);
+    assert.doesNotMatch(
+      edited.details.transcript,
+      /abandoned assistant evidence/,
+    );
+
+    session.contextEntries = [
+      ...session.contextEntries,
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "read",
+          isError: false,
+          content: [{ type: "text", text: "tool completed" }],
+        },
+      },
+    ];
+    writeSession();
+    const completed = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.match(completed.details.transcript, /tool result read:/);
+
+    const hugeToolResult =
+      "TOOL-BEGIN\n" +
+      "🙂".repeat(700) +
+      "MIDDLE-SENTINEL" +
+      "界".repeat(900) +
+      "\nTOOL-END";
+    session.contextEntries = [
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "before large tool evidence" }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "bash",
+          isError: false,
+          content: [{ type: "text", text: hugeToolResult }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "after large tool evidence" }],
+        },
+      },
+    ];
+    writeSession();
+    const boundedTool = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(boundedTool.details.transcript_truncated, true);
+    assert.match(boundedTool.details.transcript, /TOOL-BEGIN/);
+    assert.match(boundedTool.details.transcript, /TOOL-END/);
+    assert.match(
+      boundedTool.details.transcript,
+      /\[\.\.\. middle of tool result omitted \.\.\.\]/,
+    );
+    assert.doesNotMatch(boundedTool.details.transcript, /MIDDLE-SENTINEL/);
+    assert.doesNotMatch(boundedTool.details.transcript, /�/);
+    assert.match(boundedTool.details.transcript, /before large tool evidence/);
+    assert.match(boundedTool.details.transcript, /after large tool evidence/);
+    assert.ok(
+      Buffer.byteLength(boundedTool.details.transcript, "utf8") <= 16 * 1024,
+    );
+
+    session.contextEntries = [
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "old evidence ".repeat(2000) }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "recent tail evidence" }],
+        },
+      },
+    ];
+    writeSession();
+    const bounded = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(bounded.details.transcript_truncated, true);
+    assert.ok(
+      Buffer.byteLength(bounded.details.transcript, "utf8") <= 16 * 1024,
+    );
+    assert.match(bounded.details.transcript, /recent tail evidence/);
+
+
+    realFs.writeFileSync(identity.ompSessionFile, "");
+    const emptyList = await pi.tools[0]!.execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(
+      emptyList.details.agents[0].available_actions.includes("transcript"),
+      false,
+    );
+    const emptyBefore = readFileSync(identity.ompSessionFile, "utf8");
+    const emptyStatBefore = realFs.statSync(identity.ompSessionFile);
+    const rejected = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(rejected.details.ok, false);
+    assert.equal(rejected.details.error.category, "agent_busy");
+    assert.match(
+      rejected.details.error.message,
+      /Pi has not persisted this agent's session file/,
+    );
+    assert.equal(readFileSync(identity.ompSessionFile, "utf8"), emptyBefore);
+    const emptyStatAfter = realFs.statSync(identity.ompSessionFile);
+    assert.equal(emptyStatAfter.size, emptyStatBefore.size);
+    assert.equal(emptyStatAfter.mtimeMs, emptyStatBefore.mtimeMs);
+    realFs.writeFileSync(
+      identity.ompSessionFile,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timestamp: new Date().toISOString(),
+        cwd: "/tmp",
+      })}\n`,
+    );
+    const mismatched = await pi.tools[0]!.execute(
+      "id",
+      { action: "transcript", agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(mismatched.details.error.category, "target_not_found");
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(identity.ompSessionId);
+    realFs.rmSync(identity.ompSessionFile, { force: true });
+    resetAgentMailbox(mailbox);
+  }
+});

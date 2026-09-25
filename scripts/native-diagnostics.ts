@@ -1,0 +1,20 @@
+import { ts } from "ts-morph";
+import * as path from "node:path";
+import * as fs from "node:fs";
+const root = path.resolve(import.meta.dir, "../../..");
+const extension = path.join(root, "packages/omp-herdsman/extension");
+const files = fs.readdirSync(extension).filter(name => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "support.ts").map(name => path.join(extension, name));
+const config = ts.readConfigFile(path.join(root, "tsconfig.base.json"), ts.sys.readFile);
+const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root);
+const options = { ...parsed.options, allowImportingTsExtensions: true };
+const host = ts.createCompilerHost(options);
+host.getDefaultLibLocation = () => path.join(root, "node_modules/@typescript/native-preview-linux-x64/lib");
+host.getDefaultLibFileName = opts => path.join(root, "node_modules/@typescript/native-preview-linux-x64/lib", ts.getDefaultLibFileName(opts));
+const program = ts.createProgram(files, options, host);
+const diagnostics = files.flatMap(file => {
+  const source = program.getSourceFile(file);
+  return source ? [...program.getSyntacticDiagnostics(source), ...program.getSemanticDiagnostics(source)] : [];
+});
+fs.writeFileSync(path.join(import.meta.dir, "native-diagnostics.log"), ts.formatDiagnostics(diagnostics, { getCanonicalFileName: file => path.relative(root, file), getCurrentDirectory: () => root, getNewLine: () => "\n" }));
+console.log(`${diagnostics.length} Herdsman diagnostics`);
+process.exitCode = diagnostics.length ? 1 : 0;

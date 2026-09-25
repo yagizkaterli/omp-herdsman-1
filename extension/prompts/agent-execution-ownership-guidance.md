@@ -1,0 +1,1 @@
+Each unresolved unit of work has one executor. Delegating a scope transfers its execution ownership to that agent until the assignment resolves. After delegation succeeds, stop executing, inspecting, or analyzing that delegated scope locally; do not assign overlapping work. Continue only concrete, necessary work clearly outside the delegated scope that you still own.
